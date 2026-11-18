@@ -6,9 +6,10 @@ picture-in-picture, side by side, grids, your own), switches between layouts liv
 transitions, and records and streams the result. It runs on a desktop, a server or a small box,
 from its desktop window, a web browser, or remotely through its control API.
 
-> **Status:** milestone 2 (live control) done, waiting for review: shows run headless and are
-> switched live through the control API. The GUI comes in milestone 3. See
-> [docs/PLAN.md](docs/PLAN.md), [docs/milestone-2.md](docs/milestone-2.md) and [docs/api.md](docs/api.md).
+> **Status:** milestone 3 (the GUI) done, waiting for review: shows are built, run and switched
+> from a desktop window or a web browser. See [docs/PLAN.md](docs/PLAN.md),
+> [docs/milestone-3.md](docs/milestone-3.md) (with a short guide to the GUI) and
+> [docs/api.md](docs/api.md).
 
 ## Try it
 
@@ -18,10 +19,23 @@ Linux with GStreamer 1.20 or newer (developed on 1.28) and its development packa
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
 go build -o bgamix ./cmd/bgamix
+```
+
+The GUI, in a web browser or a desktop window:
+
+```
+./bgamix serve examples/test-pip.bgamix          # opens the GUI in your browser
+# the desktop window (also needs libgtk-3-dev and libwebkit2gtk-4.1-dev):
+go build -tags desktop,production,webkit2_41 -o bgamix-gui ./cmd/bgamix-gui
+./bgamix-gui examples/test-pip.bgamix
+```
+
+Headless, from the command line:
+
+```
 ./bgamix validate examples/test-pip.bgamix
-./bgamix run examples/test-pip.bgamix           # records examples/recordings/…mp4; Ctrl-C stops
-# in another terminal: switch layouts live
-curl -X POST localhost:8740/api/layout -d '{"layout": "side"}'
+./bgamix run examples/test-pip.bgamix            # records examples/recordings/…mp4; Ctrl-C stops
+curl -X POST localhost:8740/api/layout -d '{"layout": "side"}'    # in another terminal: switch live
 go test ./...                                     # decodes its own recordings and checks the pixels
 ```
 

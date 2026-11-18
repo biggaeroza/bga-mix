@@ -9,8 +9,14 @@
 //	GET  /api/ws                             WebSocket: {"type": "status", "status": …} at once and
 //	                                         every second, {"type": "event", "event": …} as they happen
 //
-// Errors are {"error": "…"} with status 400 (a bad request), 404 (nothing by that name) or 401.
-// With a token, every request needs it: "Authorization: Bearer <token>" or "?token=<token>".
+// Errors are {"error": "…"} with status 400 (a bad request), 404 (nothing by that name), 409 (no
+// show is running) or 401. With a token, every API request needs it: "Authorization: Bearer
+// <token>", "X-BGAMix-Token: <token>" or "?token=<token>" (images and WebSockets cannot send
+// headers).
+//
+// With a studio (Config.Studio), the same handler also serves the GUI: the endpoints in
+// studio.go and the embedded web UI. The access guard checks the allowed hosts (against DNS
+// rebinding) and the token.
 package server
 
 import (
@@ -19,12 +25,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/biggaeroza/bga-mix/internal/app"
 	"github.com/biggaeroza/bga-mix/internal/engine"
 	"github.com/biggaeroza/bga-mix/internal/project"
 )
@@ -32,38 +40,119 @@ import (
 // statusEvery is how often WebSocket clients get the status.
 const statusEvery = time.Second
 
-// Server serves the control API of one show.
-type Server struct {
-	show  *engine.Show
-	token string
-	mux   *http.ServeMux
+// Dialogs are the desktop's native file dialogs (nil in the browser). kind is "show", "media",
+// "image" or "program". An empty path with a nil error means the user cancelled.
+type Dialogs interface {
+	OpenFile(kind string) (string, error)
+	SaveFile(kind, suggested string) (string, error)
+	OpenFolder(title string) (string, error)
 }
 
-// New makes the API for a running show; token "" means no token is asked for.
+// Config sets up a server.
+type Config struct {
+	// Show is the show the control API acts on (nil: none is running).
+	Show func() *engine.Show
+	// Token, if set, is needed on every API request.
+	Token string
+	// AllowedHosts, if set, are the only Host (and Origin) headers accepted.
+	AllowedHosts []string
+	// Studio serves the GUI's endpoints, with Assets the UI, Dialogs the native dialogs (desktop)
+	// and InitialPath a show to open first.
+	Studio      *app.Studio
+	Assets      fs.FS
+	Dialogs     Dialogs
+	InitialPath string
+	Log         io.Writer
+}
+
+// Server serves the control API (and with a studio, the GUI).
+type Server struct {
+	cfg Config
+	mux *http.ServeMux
+}
+
+// New makes the control API for one running show; token "" means no token is asked for.
 func New(show *engine.Show, token string) *Server {
-	s := &Server{show: show, token: token, mux: http.NewServeMux()}
-	s.mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, show.Status()) })
-	s.mux.HandleFunc("POST /api/layout", s.layout)
-	s.mux.HandleFunc("POST /api/feeds/{id}/{cmd}", s.feed)
-	s.mux.HandleFunc("POST /api/recordings/{label}/{cmd}", s.recording)
-	s.mux.HandleFunc("GET /api/preview/{key}", s.preview)
-	s.mux.HandleFunc("GET /api/preview/{key}/stream", s.stream)
-	s.mux.HandleFunc("GET /api/ws", s.ws)
+	return NewServer(Config{Show: func() *engine.Show { return show }, Token: token})
+}
+
+// NewServer makes a server.
+func NewServer(cfg Config) *Server {
+	s := &Server{cfg: cfg, mux: http.NewServeMux()}
+	s.mux.HandleFunc("GET /api/status", s.withShow(func(sh *engine.Show, w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, sh.Status()) }))
+	s.mux.HandleFunc("POST /api/layout", s.withShow(s.layout))
+	s.mux.HandleFunc("POST /api/feeds/{id}/{cmd}", s.withShow(s.feed))
+	s.mux.HandleFunc("POST /api/recordings/{label}/{cmd}", s.withShow(s.recording))
+	s.mux.HandleFunc("GET /api/preview/{key}", s.withShow(s.preview))
+	s.mux.HandleFunc("GET /api/preview/{key}/stream", s.withShow(s.stream))
+	s.mux.HandleFunc("GET /api/ws", s.withShow(s.ws))
+	if cfg.Studio != nil {
+		s.studioRoutes()
+	}
+	if cfg.Assets != nil {
+		s.mux.Handle("GET /", http.FileServer(http.FS(cfg.Assets)))
+	}
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.token != "" {
-		got := r.URL.Query().Get("token")
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			got = strings.TrimPrefix(h, "Bearer ")
+// withShow runs a handler on the running show, or answers 409.
+func (s *Server) withShow(f func(*engine.Show, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var sh *engine.Show
+		if s.cfg.Show != nil {
+			sh = s.cfg.Show()
 		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
-			writeErr(w, 401, errors.New("a token is needed"))
+		if sh == nil {
+			writeErr(w, 409, errors.New("no show is running"))
+			return
+		}
+		f(sh, w, r)
+	}
+}
+
+func (s *Server) hostAllowed(host string) bool {
+	for _, a := range s.cfg.AllowedHosts {
+		if strings.EqualFold(host, a) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if len(s.cfg.AllowedHosts) > 0 {
+		if !s.hostAllowed(r.Host) {
+			writeErr(w, 403, errors.New("host not allowed"))
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" && !s.hostAllowed(strings.TrimPrefix(o, "http://")) {
+			writeErr(w, 403, errors.New("origin not allowed"))
 			return
 		}
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		if s.cfg.Token != "" {
+			got := r.URL.Query().Get("token")
+			if h := r.Header.Get("X-BGAMix-Token"); h != "" {
+				got = h
+			}
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				got = strings.TrimPrefix(h, "Bearer ")
+			}
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.Token)) != 1 {
+				writeErr(w, 401, errors.New("a token is needed"))
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	if s.cfg.Log == nil {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	t0 := time.Now()
 	s.mux.ServeHTTP(w, r)
+	fmt.Fprintf(s.cfg.Log, "%s %s %s\n", r.Method, r.URL.Path, time.Since(t0).Round(time.Millisecond))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -77,8 +166,10 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 }
 
 // readBody decodes an optional JSON body strictly.
-func readBody(r *http.Request, v any) error {
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
+func readBody(r *http.Request, v any) error { return readBodyLimit(r, v, 1<<16) }
+
+func readBodyLimit(r *http.Request, v any, limit int64) error {
+	d := json.NewDecoder(io.LimitReader(r.Body, limit))
 	d.DisallowUnknownFields()
 	if err := d.Decode(v); err != nil && err != io.EOF {
 		return fmt.Errorf("the request body: %v", err)
@@ -95,7 +186,7 @@ func commandErr(w http.ResponseWriter, err error) {
 	writeErr(w, code, err)
 }
 
-func (s *Server) layout(w http.ResponseWriter, r *http.Request) {
+func (s *Server) layout(show *engine.Show, w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Layout     string              `json:"layout"`
 		Transition *project.Transition `json:"transition"`
@@ -108,14 +199,14 @@ func (s *Server) layout(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errors.New("transition: kind cut or mix, duration_s 0 to 60"))
 		return
 	}
-	if err := s.show.SetLayout(req.Layout, req.Transition); err != nil {
+	if err := show.SetLayout(req.Layout, req.Transition); err != nil {
 		commandErr(w, err)
 		return
 	}
-	writeJSON(w, 200, s.show.Status())
+	writeJSON(w, 200, show.Status())
 }
 
-func (s *Server) feed(w http.ResponseWriter, r *http.Request) {
+func (s *Server) feed(show *engine.Show, w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Seconds float64 `json:"seconds"`
 	}
@@ -123,23 +214,23 @@ func (s *Server) feed(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	if err := s.show.FeedCommand(r.PathValue("id"), r.PathValue("cmd"), req.Seconds); err != nil {
+	if err := show.FeedCommand(r.PathValue("id"), r.PathValue("cmd"), req.Seconds); err != nil {
 		commandErr(w, err)
 		return
 	}
-	writeJSON(w, 200, s.show.Status())
+	writeJSON(w, 200, show.Status())
 }
 
-func (s *Server) recording(w http.ResponseWriter, r *http.Request) {
-	if err := s.show.RecordingCommand(r.PathValue("label"), r.PathValue("cmd")); err != nil {
+func (s *Server) recording(show *engine.Show, w http.ResponseWriter, r *http.Request) {
+	if err := show.RecordingCommand(r.PathValue("label"), r.PathValue("cmd")); err != nil {
 		commandErr(w, err)
 		return
 	}
-	writeJSON(w, 200, s.show.Status())
+	writeJSON(w, 200, show.Status())
 }
 
-func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
-	b, _, ok := s.show.Preview(r.PathValue("key"))
+func (s *Server) preview(show *engine.Show, w http.ResponseWriter, r *http.Request) {
+	b, _, ok := show.Preview(r.PathValue("key"))
 	if !ok {
 		writeErr(w, 404, fmt.Errorf("no preview %q (yet)", r.PathValue("key")))
 		return
@@ -150,10 +241,10 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 }
 
 // stream sends the preview as multipart MJPEG, a frame whenever a new one is there.
-func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
+func (s *Server) stream(show *engine.Show, w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	if _, _, ok := s.show.Preview(key); !ok {
-		if st := s.show.Status(); !st.Previews {
+	if _, _, ok := show.Preview(key); !ok {
+		if st := show.Status(); !st.Previews {
 			writeErr(w, 404, errors.New("previews are off"))
 			return
 		}
@@ -171,7 +262,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-tick.C:
 		}
-		b, at, ok := s.show.Preview(key)
+		b, at, ok := show.Preview(key)
 		if !ok || !at.After(last) {
 			continue
 		}
@@ -196,13 +287,13 @@ type Message struct {
 
 var upgrader = websocket.Upgrader{} // same-origin browsers only (clients without an Origin header are let in)
 
-func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ws(show *engine.Show, w http.ResponseWriter, r *http.Request) {
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer c.Close()
-	events, cancel := s.show.Subscribe()
+	events, cancel := show.Subscribe()
 	defer cancel()
 	gone := make(chan struct{})
 	go func() { // reads only to notice the client closing
@@ -217,7 +308,7 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return c.WriteJSON(m) == nil
 	}
-	status := func() bool { st := s.show.Status(); return send(Message{Type: "status", Status: &st}) }
+	status := func() bool { st := show.Status(); return send(Message{Type: "status", Status: &st}) }
 	if !status() {
 		return
 	}

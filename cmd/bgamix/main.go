@@ -3,6 +3,7 @@
 //	bgamix version
 //	bgamix validate <show.bgamix>
 //	bgamix run      <show.bgamix> [-t seconds] [-listen addr] [-token t] [-previews=false]
+//	bgamix serve    [show.bgamix] [-port n] [-no-browser]
 package main
 
 import (
@@ -31,6 +32,7 @@ const usage = `usage:
       -listen addr     the control API (default 127.0.0.1:8740; "none" for none); see docs/api.md
       -token t         a token the API asks for (needed when it listens beyond this computer)
       -previews=false  no JPEG previews
+  bgamix serve    [show.bgamix] [-port 8740] [-no-browser]   the GUI in a web browser
 `
 
 func fail(err error) {
@@ -55,6 +57,10 @@ func main() {
 			fail(err)
 		}
 		fmt.Printf("%s: valid: %d feed(s), %d layout(s), %d recording(s)\n", os.Args[2], len(p.Feeds), len(p.Layouts), len(p.Recordings))
+	case "serve":
+		if err := cmdServe(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
 	case "run":
 		if err := run(os.Args[2:]); err != nil {
 			fail(err)
