@@ -1,0 +1,7 @@
+/bgamix
+/bgamix-gui
+/bgamix.exe
+/bgamix-gui.exe
+/dist/
+/out/
+*.test
