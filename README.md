@@ -6,8 +6,26 @@ picture-in-picture, side by side, grids, your own), switches between layouts liv
 transitions, and records and streams the result. It runs on a desktop, a server or a small box,
 from its desktop window, a web browser, or remotely through its control API.
 
-> **Status:** planning approved 2026-11-18; milestone 1 (the engine core) under way.
-> See [docs/PLAN.md](docs/PLAN.md).
+> **Status:** milestone 1 (the engine core) done, waiting for review: shows run headless from
+> the command line. The GUI comes in milestone 3. See [docs/PLAN.md](docs/PLAN.md) and
+> [docs/milestone-1.md](docs/milestone-1.md).
+
+## Try it
+
+Linux with GStreamer 1.20 or newer (developed on 1.28) and its development packages:
+
+```
+sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+go build -o bgamix ./cmd/bgamix
+./bgamix validate examples/test-pip.bgamix
+./bgamix run examples/test-pip.bgamix -t 10      # records examples/recordings/…mp4
+go test ./...                                     # decodes its own recordings and checks the pixels
+```
+
+A show is a `.bgamix` file (JSON): the output picture, the feeds (test patterns, video files, still
+images), layouts that place them (boxes as fractions of the picture) and recordings. See
+`examples/` and [docs/milestone-1.md](docs/milestone-1.md).
 
 ## How it works
 
