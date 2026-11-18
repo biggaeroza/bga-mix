@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -34,38 +35,86 @@ func TestPlace(t *testing.T) {
 
 func TestPipelines(t *testing.T) {
 	p := testProject()
-	f := FeedPipeline(p.Feeds[1], p.Output, "/show", "ch")
-	for _, want := range []string{`location="/show/my \"clip\".mp4"`, "decodebin", "videoscale add-borders=true", "colorimetry=bt709", `intervideosink channel="ch"`} {
+	f := FeedPipeline(p.Feeds[1], 0, p.Output, "/show", "ch")
+	for _, want := range []string{`location="/show/my \"clip\".mp4"`, "decodebin", "videoscale add-borders=true", "colorimetry=bt709", `intervideosink name=out show-preroll-frame=false channel="ch"`} {
 		if !strings.Contains(f, want) {
 			t.Errorf("file feed lacks %q: %s", want, f)
 		}
 	}
-	if img := FeedPipeline(p.Feeds[2], p.Output, "/show", "ch"); !strings.Contains(img, `location="/abs/card.png"`) || !strings.Contains(img, "imagefreeze is-live=true") {
+	if img := FeedPipeline(p.Feeds[2], 0, p.Output, "/show", "ch"); !strings.Contains(img, `location="/abs/card.png"`) || !strings.Contains(img, "imagefreeze is-live=true") {
 		t.Errorf("image feed: %s", img)
 	}
-	m := MixerPipeline(p, p.Start(), "R", []string{"/r/a.mp4", "/r/b.mkv"})
+	m := MixerPipeline(p, p.Start(), "R")
 	for _, want := range []string{
 		"start-time-selection=first", "sink_1::xpos=768", "sink_1::alpha=0.5", "sink_2::alpha=0",
-		`intervideosrc channel="bgamix-R-clip" timeout=`, // held (end hold)
-		"mp4mux fragment-duration=1000 streamable=true", `location="/r/a.mp4"`,
-		"x265enc bitrate=9000", "matroskamux",
+		`intervideosrc channel="bgamix-R-f-clip" timeout=`, // held (end hold)
+		`intervideosink channel="bgamix-R-program"`,
 	} {
 		if !strings.Contains(m, want) {
 			t.Errorf("mixer lacks %q", want)
 		}
 	}
-	if strings.Contains(m, `channel="bgamix-R-cam" timeout`) {
+	if strings.Contains(m, `channel="bgamix-R-f-cam" timeout`) {
 		t.Error("a test feed should go black, not be held, when it stops")
+	}
+	r := RecordingPipeline(p.Recordings[0], p.Output, "ch", false, "/r/a.mp4")
+	for _, want := range []string{"mp4mux fragment-duration=1000 streamable=true", `location="/r/a.mp4"`, "buffer-mode=unbuffered", "x264enc bitrate=4100"} {
+		if !strings.Contains(r, want) {
+			t.Errorf("recording lacks %q: %s", want, r)
+		}
+	}
+	r = RecordingPipeline(p.Recordings[1], p.Output, "ch", false, "/r/b.mkv")
+	if !strings.Contains(r, "x265enc bitrate=9000") || !strings.Contains(r, "matroskamux") {
+		t.Errorf("h265 mkv: %s", r)
+	}
+	seg := project.Recording{Path: "x", SegmentS: 60, SegmentMB: 500}
+	r = RecordingPipeline(seg, p.Output, "ch", false, "/r/s.mp4")
+	for _, want := range []string{"splitmuxsink", "muxer-factory=mp4mux", `muxer-properties="properties,fragment-duration=1000,streamable=true"`,
+		`location="/r/s-%03d.mp4"`, "max-size-time=60000000000", "max-size-bytes=500000000", "start-index=1"} {
+		if !strings.Contains(r, want) {
+			t.Errorf("segmented lacks %q: %s", want, r)
+		}
+	}
+	if pv := PreviewPipeline(p.Output, "ch", true); !strings.Contains(pv, "width=320,height=180") || !strings.Contains(pv, "appsink name=jpeg") {
+		t.Errorf("preview: %s", pv)
+	}
+}
+
+// A mix moves boxes linearly, keeping the target's order.
+func TestLerp(t *testing.T) {
+	a, b := PadProps{0, 0, 100, 100, 1, 1}, PadProps{100, 50, 50, 50, 3, 0}
+	if m := Lerp(a, b, 0.5); m != (PadProps{50, 25, 75, 75, 3, 0.5}) {
+		t.Errorf("%+v", m)
+	}
+	if Lerp(a, b, 1.5) != b || Lerp(a, b, -1).X != 0 {
+		t.Error("clamped")
+	}
+}
+
+// A recording never overwrites: -2, -3 … are added.
+func TestFreePath(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/a.mp4"
+	if FreePath(p, false) != p {
+		t.Fatal("free")
+	}
+	os.WriteFile(p, nil, 0o644)
+	if got := FreePath(p, false); got != dir+"/a-2.mp4" {
+		t.Error(got)
+	}
+	os.WriteFile(dir+"/s-001.mp4", nil, 0o644)
+	if got := FreePath(dir+"/s.mp4", true); got != dir+"/s-2.mp4" {
+		t.Error(got)
 	}
 }
 
 func TestRecordingPath(t *testing.T) {
 	p := testProject()
 	at := time.Date(2026, 11, 18, 9, 5, 7, 0, time.UTC)
-	if got := RecordingPath(p.Recordings[0], p, "/show", at); got != "/show/rec/My-Show-2026-11-18.mp4" {
+	if got := RecordingPath(p.Recordings[0], p, "", "/show", at); got != "/show/rec/My-Show-2026-11-18.mp4" {
 		t.Errorf("%s", got)
 	}
-	if got := RecordingPath(project.Recording{Path: "/abs/{time}.mov"}, p, "/show", at); got != "/abs/09-05-07.mov" {
+	if got := RecordingPath(project.Recording{Path: "/abs/{feed}-{time}.mov"}, p, "cam 1", "/show", at); got != "/abs/cam-1-09-05-07.mov" {
 		t.Errorf("%s", got)
 	}
 }

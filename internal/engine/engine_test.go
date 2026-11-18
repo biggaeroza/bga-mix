@@ -144,7 +144,7 @@ func alpha(v float64) *float64 { return &v }
 // runShow runs a show for a while and returns its recording's frames and its events.
 func runShow(t *testing.T, p *project.Project, dir string, d time.Duration) ([]frame, []Event) {
 	t.Helper()
-	s, err := Start(p, dir)
+	s, err := Start(p, dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ loop:
 			t.Errorf("%s error: %s", e.Feed, e.Text)
 		}
 	}
-	return decode(t, s.Recordings[0]), evs
+	return decode(t, s.Recordings()[0]), evs
 }
 
 func count(evs []Event, feed, kind string) int {
@@ -317,7 +317,7 @@ func TestCrashSafeRecording(t *testing.T) {
 			Layouts:    []project.Layout{{ID: "full", Boxes: []project.Box{{Feed: "g", W: 1, H: 1}}}},
 			Recordings: []project.Recording{{Path: os.Getenv("BGAMIX_CRASH_HELPER")}},
 		}
-		if _, err := Start(p, ""); err != nil {
+		if _, err := Start(p, "", Options{}); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Hour)

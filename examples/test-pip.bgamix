@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "name": "Test picture-in-picture",
-  "notes": "Two test patterns: colour bars full screen and a bouncing ball in the top-right corner, recorded to recordings/.",
+  "notes": "Two test patterns and three layouts to switch between live (see docs/api.md); recorded to recordings/.",
   "output": { "width": 1280, "height": 720, "fps": 30 },
   "feeds": [
     { "id": "bars", "name": "Colour bars", "type": "test", "pattern": "smpte" },
@@ -15,7 +15,17 @@
         { "feed": "bars", "x": 0, "y": 0, "w": 1, "h": 1 },
         { "feed": "ball", "x": 0.66, "y": 0.04, "w": 0.3, "h": 0.3 }
       ]
-    }
+    },
+    {
+      "id": "side",
+      "name": "Side by side",
+      "boxes": [
+        { "feed": "bars", "x": 0, "y": 0.25, "w": 0.5, "h": 0.5 },
+        { "feed": "ball", "x": 0.5, "y": 0.25, "w": 0.5, "h": 0.5 }
+      ]
+    },
+    { "id": "ball", "name": "Ball full screen", "boxes": [ { "feed": "ball", "x": 0, "y": 0, "w": 1, "h": 1 } ] }
   ],
+  "transition": { "kind": "mix", "duration_s": 0.6 },
   "recordings": [ { "path": "recordings/{project}-{date}-{time}" } ]
 }

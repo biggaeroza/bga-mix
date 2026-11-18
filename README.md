@@ -6,9 +6,9 @@ picture-in-picture, side by side, grids, your own), switches between layouts liv
 transitions, and records and streams the result. It runs on a desktop, a server or a small box,
 from its desktop window, a web browser, or remotely through its control API.
 
-> **Status:** milestone 1 (the engine core) done, waiting for review: shows run headless from
-> the command line. The GUI comes in milestone 3. See [docs/PLAN.md](docs/PLAN.md) and
-> [docs/milestone-1.md](docs/milestone-1.md).
+> **Status:** milestone 2 (live control) done, waiting for review: shows run headless and are
+> switched live through the control API. The GUI comes in milestone 3. See
+> [docs/PLAN.md](docs/PLAN.md), [docs/milestone-2.md](docs/milestone-2.md) and [docs/api.md](docs/api.md).
 
 ## Try it
 
@@ -19,7 +19,9 @@ sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstream
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
 go build -o bgamix ./cmd/bgamix
 ./bgamix validate examples/test-pip.bgamix
-./bgamix run examples/test-pip.bgamix -t 10      # records examples/recordings/…mp4
+./bgamix run examples/test-pip.bgamix           # records examples/recordings/…mp4; Ctrl-C stops
+# in another terminal: switch layouts live
+curl -X POST localhost:8740/api/layout -d '{"layout": "side"}'
 go test ./...                                     # decodes its own recordings and checks the pixels
 ```
 

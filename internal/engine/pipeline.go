@@ -1,7 +1,12 @@
-// Package engine runs a show on GStreamer. Each feed runs in its own pipeline and hands its
-// frames to the mixer through an intervideo channel, so a feed that stalls or fails never stops
-// the mix. The mixer pipeline composites one pad per feed (placed by the layout) and tees the
-// program to the recordings.
+// Package engine runs a show on GStreamer. Every part of a show is its own pipeline, joined by
+// intervideo channels:
+//
+//	feed pipelines ──► channel per feed ──► mixer (compositor, placed by the layout) ──► program channel
+//	                         │                                                              │
+//	                         └──► clean ISO recordings, previews        recordings, previews ◄┘
+//
+// so a feed that stalls or fails never stops the mix (it is rebuilt by its supervisor), and a
+// recording starts, pauses and stops on its own. A channel may have several readers.
 //
 // The pipelines are described in GStreamer's launch syntax: the builders here are plain string
 // functions (tested without GStreamer), and engine.go runs them.
@@ -10,6 +15,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,6 +43,12 @@ const bitsPerPixel = 0.15
 // (1 s) turns a feed that stops into black.
 const holdTimeout = uint64(1) << 60
 
+// Previews are small JPEGs of the program and each feed, for the UI.
+const (
+	PreviewWidth = 320
+	PreviewFPS   = 5
+)
+
 func caps(o project.Output) string {
 	return fmt.Sprintf("video/x-raw,format=%s,width=%d,height=%d,pixel-aspect-ratio=1/1,framerate=%d/1,colorimetry=%s,chroma-site=mpeg2,interlace-mode=progressive",
 		rawFormat, o.Width, o.Height, o.FPS, colorimetry)
@@ -47,14 +59,31 @@ func quote(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
-// Channel is a feed's intervideo channel in a run.
-func Channel(runID, feedID string) string { return "bgamix-" + runID + "-" + feedID }
+// FeedChannel and ProgramChannel name a run's intervideo channels.
+func FeedChannel(runID, feedID string) string { return "bgamix-" + runID + "-f-" + feedID }
+func ProgramChannel(runID string) string      { return "bgamix-" + runID + "-program" }
 
-// FeedPipeline describes a feed's pipeline: its source, normalised to the output (scaled to fit
-// with borders, the output's frame rate and format), into its intervideo channel.
-func FeedPipeline(f project.Feed, o project.Output, dir, channel string) string {
+// Held reports whether a feed's channel keeps its last frame when the feed stops sending (files,
+// playlists and images: paused, ended or between playlist items); a test pattern that stops
+// goes black after a second.
+func Held(f project.Feed) bool {
+	return f.Type == project.FeedFile || f.Type == project.FeedPlaylist || f.Type == project.FeedImage
+}
+
+// FeedPipeline describes a feed's pipeline: its source (for a playlist, its item'th file),
+// normalised to the output (scaled to fit with borders, the output's frame rate and format),
+// into its intervideo channel.
+func FeedPipeline(f project.Feed, item int, o project.Output, dir, channel string) string {
 	norm := "videoconvert ! videoscale add-borders=true ! videorate ! " + caps(o)
 	sink := "intervideosink channel=" + quote(channel)
+	file := func(path string) string {
+		// show-preroll-frame=false: the frame decoded while the file is paused before its seek
+		// to the in point would otherwise reach the mix (a flash of the file's start)
+		// (it is turned on again after that seek, so that seeking a paused file shows the frame)
+		sink := "intervideosink name=out show-preroll-frame=false channel=" + quote(channel)
+		// decodebin's audio pad stays unlinked until audio is mixed (milestone 4)
+		return fmt.Sprintf("filesrc location=%s ! decodebin name=dec dec. ! video/x-raw ! queue ! %s ! %s", quote(project.Resolve(dir, path)), norm, sink)
+	}
 	switch f.Type {
 	case project.FeedTest:
 		pat := f.Pattern
@@ -63,9 +92,9 @@ func FeedPipeline(f project.Feed, o project.Output, dir, channel string) string 
 		}
 		return fmt.Sprintf("videotestsrc is-live=true pattern=%s ! %s ! %s", pat, norm, sink)
 	case project.FeedFile:
-		// decodebin's audio pad stays unlinked until audio arrives (milestone 4)
-		return fmt.Sprintf("filesrc location=%s ! decodebin name=dec dec. ! video/x-raw ! queue ! %s ! %s",
-			quote(project.Resolve(dir, f.Path)), norm, sink)
+		return file(f.Path)
+	case project.FeedPlaylist:
+		return file(f.Items[item])
 	case project.FeedImage:
 		return fmt.Sprintf("filesrc location=%s ! decodebin ! imagefreeze is-live=true ! %s ! %s",
 			quote(project.Resolve(dir, f.Path)), norm, sink)
@@ -80,7 +109,7 @@ type PadProps struct {
 }
 
 // Place computes each feed's pad placement in a layout: feeds the layout does not show are
-// transparent. Boxes are drawn in layout order (later on top).
+// transparent, full size at the bottom. Boxes are drawn in layout order (later on top).
 func Place(p *project.Project, l *project.Layout) map[string]PadProps {
 	o := p.Output
 	out := map[string]PadProps{}
@@ -105,14 +134,81 @@ func Place(p *project.Project, l *project.Layout) map[string]PadProps {
 
 func even(v float64) int { return max(2, int(math.Round(v/2))*2) }
 
-// RecordingPath expands a recording's path ({project}, {date}, {time}) against the project's
-// folder, adding the container's extension when the path has none.
-func RecordingPath(r project.Recording, p *project.Project, dir string, at time.Time) string {
-	name := strings.NewReplacer("{project}", safeName(p.Name), "{date}", at.Format("2006-01-02"), "{time}", at.Format("15-04-05")).Replace(r.Path)
+// Lerp is the placement a fraction t (0 to 1) of the way from a to b: position, size and alpha
+// move linearly; the stacking order is b's throughout (the incoming boxes fade in on top).
+func Lerp(a, b PadProps, t float64) PadProps {
+	t = math.Max(0, math.Min(1, t))
+	l := func(x, y int) int { return int(math.Round(float64(x) + t*float64(y-x))) }
+	return PadProps{X: l(a.X, b.X), Y: l(a.Y, b.Y), W: max(2, l(a.W, b.W)), H: max(2, l(a.H, b.H)), Z: b.Z, Alpha: a.Alpha + t*(b.Alpha-a.Alpha)}
+}
+
+// MixerPipeline describes the mixer: an intervideosrc per feed (in project order) into the
+// compositor, placed by the layout, into the program channel. The compositor takes its start
+// time from its first input (otherwise its first frames carry no timestamps).
+func MixerPipeline(p *project.Project, l *project.Layout, runID string) string {
+	o := p.Output
+	place := Place(p, l)
+	var b strings.Builder
+	b.WriteString("compositor name=mix start-time-selection=first background=black")
+	for i, f := range p.Feeds {
+		pp := place[f.ID]
+		fmt.Fprintf(&b, " sink_%d::xpos=%d sink_%d::ypos=%d sink_%d::width=%d sink_%d::height=%d sink_%d::zorder=%d sink_%d::alpha=%g",
+			i, pp.X, i, pp.Y, i, pp.W, i, pp.H, i, pp.Z, i, pp.Alpha)
+	}
+	fmt.Fprintf(&b, " ! %s ! intervideosink channel=%s", caps(o), quote(ProgramChannel(runID)))
+	for i, f := range p.Feeds {
+		fmt.Fprintf(&b, " %s ! queue ! mix.sink_%d", channelSource(FeedChannel(runID, f.ID), Held(f), o), i)
+	}
+	return b.String()
+}
+
+func channelSource(channel string, held bool, o project.Output) string {
+	timeout := ""
+	if held {
+		timeout = fmt.Sprintf(" timeout=%d", holdTimeout)
+	}
+	return fmt.Sprintf("intervideosrc channel=%s%s ! %s", quote(channel), timeout, caps(o))
+}
+
+// RecordingPath expands a recording's path ({project}, {feed}, {date}, {time}) against the
+// project's folder, adding the container's extension when the path has none.
+func RecordingPath(r project.Recording, p *project.Project, feed, dir string, at time.Time) string {
+	name := strings.NewReplacer("{project}", safeName(p.Name), "{feed}", safeName(feed), "{date}", at.Format("2006-01-02"),
+		"{time}", at.Format("15-04-05")).Replace(r.Path)
 	if filepath.Ext(name) == "" {
 		name += "." + container(r)
 	}
 	return project.Resolve(dir, name)
+}
+
+// FreePath returns path, or path with -2, -3 … before its extension when the file (or its
+// first segment) already exists, so that a recording never overwrites an earlier one.
+func FreePath(path string, segmented bool) string {
+	exists := func(p string) bool {
+		if segmented {
+			p = strings.Replace(SegmentPattern(p), "%03d", "001", 1)
+		}
+		_, err := os.Stat(p)
+		return err == nil
+	}
+	if !exists(path) {
+		return path
+	}
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	for n := 2; ; n++ {
+		c := fmt.Sprintf("%s-%d%s", base, n, ext)
+		if !exists(c) {
+			return c
+		}
+	}
+}
+
+// SegmentPattern is a segmented recording's file pattern (splitmuxsink's location): -%03d before
+// the extension, counting from 001.
+func SegmentPattern(path string) string {
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + "-%03d" + ext
 }
 
 func safeName(s string) string {
@@ -150,52 +246,51 @@ func Bitrate(r project.Recording, o project.Output) int {
 	return int(math.Round(k/100) * 100)
 }
 
-// recordingBranch encodes the program and writes it. MP4 and MOV are fragmented (a fragment and a
-// key frame every second) and streamable (the header first), and every buffer is written at once,
-// so a recording cut short by a crash still plays up to its last fragment.
-func recordingBranch(r project.Recording, o project.Output, path string) string {
+// RecordingPipeline describes a recording of a channel (the program, or a feed for an ISO
+// recording): encoded and muxed into path. MP4 and MOV are fragmented (a fragment and a key
+// frame every second) and streamable (the header first), and every buffer is written at once
+// (filesink's default 64 kB of in-process buffering emptied a killed low-bitrate recording), so a
+// recording cut short by a crash still plays up to its last fragment. With segments, splitmuxsink
+// starts a new file at the first key frame after each limit.
+func RecordingPipeline(r project.Recording, o project.Output, channel string, held bool, path string) string {
 	k := Bitrate(r, o)
 	enc := fmt.Sprintf("x264enc bitrate=%d speed-preset=veryfast tune=zerolatency key-int-max=%d ! h264parse", k, o.FPS)
 	if r.Codec == "h265" {
 		enc = fmt.Sprintf("x265enc bitrate=%d speed-preset=veryfast tune=zerolatency key-int-max=%d ! h265parse", k, o.FPS)
 	}
-	mux := "mp4mux fragment-duration=1000 streamable=true"
+	mux, muxProps := "mp4mux", "fragment-duration=1000 streamable=true"
 	switch container(r) {
 	case "mkv":
-		mux = "matroskamux"
+		mux, muxProps = "matroskamux", ""
 	case "mov":
-		mux = "qtmux fragment-duration=1000 streamable=true"
+		mux = "qtmux"
 	}
-	// unbuffered: filesink's default 64 kB of buffering in the process is lost with the process,
-	// which emptied a low-bitrate recording killed after a few seconds
-	return fmt.Sprintf("prog. ! queue ! videoconvert ! %s ! %s ! filesink buffer-mode=unbuffered location=%s", enc, mux, quote(path))
+	src := channelSource(channel, held, o) + " ! queue ! videoconvert ! " + enc
+	if r.SegmentS > 0 || r.SegmentMB > 0 {
+		var lim string
+		if r.SegmentS > 0 {
+			lim += fmt.Sprintf(" max-size-time=%d", int64(r.SegmentS*1e9))
+		}
+		if r.SegmentMB > 0 {
+			lim += fmt.Sprintf(" max-size-bytes=%d", int64(r.SegmentMB*1e6))
+		}
+		mp := ""
+		if muxProps != "" {
+			mp = fmt.Sprintf(` muxer-properties="properties,%s"`, strings.ReplaceAll(muxProps, " ", ","))
+		}
+		return fmt.Sprintf(`%s ! splitmuxsink name=out muxer-factory=%s%s sink-properties="properties,buffer-mode=unbuffered" start-index=1 location=%s%s`,
+			src, mux, mp, quote(SegmentPattern(path)), lim)
+	}
+	if muxProps != "" {
+		mux += " " + muxProps
+	}
+	return fmt.Sprintf("%s ! %s ! filesink name=out buffer-mode=unbuffered location=%s", src, mux, quote(path))
 }
 
-// MixerPipeline describes the mixer: an intervideosrc per feed (in project order) into the
-// compositor, placed by the layout, and the program teed to each recording (and to a sink that
-// keeps the mix running when nothing records). The compositor takes its start time from its
-// first input: otherwise its first frames reach the MP4 muxer without timestamps.
-func MixerPipeline(p *project.Project, l *project.Layout, runID string, recPaths []string) string {
-	o := p.Output
-	place := Place(p, l)
-	var b strings.Builder
-	b.WriteString("compositor name=mix start-time-selection=first background=black")
-	for i, f := range p.Feeds {
-		pp := place[f.ID]
-		fmt.Fprintf(&b, " sink_%d::xpos=%d sink_%d::ypos=%d sink_%d::width=%d sink_%d::height=%d sink_%d::zorder=%d sink_%d::alpha=%g",
-			i, pp.X, i, pp.Y, i, pp.W, i, pp.H, i, pp.Z, i, pp.Alpha)
-	}
-	fmt.Fprintf(&b, " ! %s ! tee name=prog", caps(o))
-	b.WriteString(" prog. ! queue leaky=downstream max-size-buffers=2 ! fakesink sync=false")
-	for i, r := range p.Recordings {
-		b.WriteString(" " + recordingBranch(r, o, recPaths[i]))
-	}
-	for i, f := range p.Feeds {
-		timeout := ""
-		if f.Type == project.FeedFile && f.End == project.EndHold || f.Type == project.FeedImage {
-			timeout = fmt.Sprintf(" timeout=%d", holdTimeout)
-		}
-		fmt.Fprintf(&b, " intervideosrc channel=%s%s ! %s ! queue ! mix.sink_%d", quote(Channel(runID, f.ID)), timeout, caps(o), i)
-	}
-	return b.String()
+// PreviewPipeline describes a channel's preview: a few JPEGs a second, PreviewWidth wide, into
+// an appsink named "jpeg" that keeps only the latest.
+func PreviewPipeline(o project.Output, channel string, held bool) string {
+	h := even(float64(PreviewWidth) * float64(o.Height) / float64(o.Width))
+	return fmt.Sprintf("%s ! videorate drop-only=true ! video/x-raw,framerate=%d/1 ! videoscale ! video/x-raw,width=%d,height=%d ! videoconvert ! jpegenc quality=75 ! appsink name=jpeg max-buffers=1 drop=true sync=false",
+		channelSource(channel, held, o), PreviewFPS, PreviewWidth, h)
 }

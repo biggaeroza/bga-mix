@@ -34,16 +34,20 @@ func TestReadValid(t *testing.T) {
 // Problems are reported with their paths; unknown fields are refused.
 func TestProblems(t *testing.T) {
 	for edit, want := range map[[2]string]string{
-		{`"fps": 30`, `"fps": 0`}:                                   "output.fps",
-		{`"width": 1280`, `"width": 1281`}:                          "output.width",
-		{`"type": "test"`, `"type": "camera"`}:                      "feeds[0].type",
-		{`"id": "clip"`, `"id": "cam"`}:                             "feeds[1].id",
-		{`"end": "hold"`, `"end": "rewind"`}:                        "feeds[1].end",
-		{`"feed": "clip"`, `"feed": "nope"`}:                        "layouts[0].boxes[1].feed",
-		{`"w": 0.35`, `"w": 1.5`}:                                   "layouts[0].boxes[1]",
-		{`"path": "rec/{date}"`, `"path": "r", "container": "avi"`}: "recordings[0].container",
-		{`"name": "t"`, `"name": "t", "colour": "red"`}:             "unknown field",
-		{`"feeds": [`, `"start_layout": "x", "feeds": [`}:           "start_layout",
+		{`"fps": 30`, `"fps": 0`}:                                    "output.fps",
+		{`"width": 1280`, `"width": 1281`}:                           "output.width",
+		{`"type": "test"`, `"type": "camera"`}:                       "feeds[0].type",
+		{`"id": "clip"`, `"id": "cam"`}:                              "feeds[1].id",
+		{`"end": "hold"`, `"end": "rewind"`}:                         "feeds[1].end",
+		{`"feed": "clip"`, `"feed": "nope"`}:                         "layouts[0].boxes[1].feed",
+		{`"w": 0.35`, `"w": 1.5`}:                                    "layouts[0].boxes[1]",
+		{`"path": "rec/{date}"`, `"path": "r", "container": "avi"`}:  "recordings[0].container",
+		{`"name": "t"`, `"name": "t", "colour": "red"`}:              "unknown field",
+		{`"feeds": [`, `"start_layout": "x", "feeds": [`}:            "start_layout",
+		{`"feeds": [`, `"transition": {"kind": "wipe"}, "feeds": [`}: "transition.kind",
+		{`"type": "test"`, `"type": "playlist"`}:                     "feeds[0].items",
+		{`"end": "hold"`, `"end": "return", "iso": {"path": ""}`}:    "feeds[1].iso.path",
+		{`"path": "rec/{date}"`, `"path": "r", "segment_s": 1`}:      "recordings[0].segment_s",
 	} {
 		_, err := Read(strings.NewReader(strings.Replace(valid, edit[0], edit[1], 1)), "")
 		if err == nil || !strings.Contains(err.Error(), want) {

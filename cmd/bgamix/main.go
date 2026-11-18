@@ -2,12 +2,15 @@
 //
 //	bgamix version
 //	bgamix validate <show.bgamix>
-//	bgamix run      <show.bgamix> [-t seconds]
+//	bgamix run      <show.bgamix> [-t seconds] [-listen addr] [-token t] [-previews=false]
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,13 +19,18 @@ import (
 
 	"github.com/biggaeroza/bga-mix/internal/engine"
 	"github.com/biggaeroza/bga-mix/internal/project"
+	"github.com/biggaeroza/bga-mix/internal/server"
 	"github.com/biggaeroza/bga-mix/internal/version"
 )
 
 const usage = `usage:
   bgamix version
   bgamix validate <show.bgamix>                  check a show file
-  bgamix run      <show.bgamix> [-t seconds]     run a show headless until Ctrl-C (or -t)
+  bgamix run      <show.bgamix> [flags]          run a show headless until Ctrl-C, controlled by its API
+      -t seconds       stop after this long
+      -listen addr     the control API (default 127.0.0.1:8740; "none" for none); see docs/api.md
+      -token t         a token the API asks for (needed when it listens beyond this computer)
+      -previews=false  no JPEG previews
 `
 
 func fail(err error) {
@@ -66,17 +74,34 @@ func run(args []string) error {
 	path := args[0]
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	dur := fs.Float64("t", 0, "stop after this many seconds (0: run until Ctrl-C)")
+	listen := fs.String("listen", "127.0.0.1:8740", `the control API's address ("none": no API)`)
+	token := fs.String("token", os.Getenv("BGAMIX_TOKEN"), "a token the API asks for (default $BGAMIX_TOKEN)")
+	previews := fs.Bool("previews", true, "keep JPEG previews for the API")
 	fs.Parse(args[1:])
 	p, err := project.Load(path)
 	if err != nil {
 		return err
 	}
-	s, err := engine.Start(p, filepath.Dir(path))
+	var ln net.Listener
+	if *listen != "none" {
+		host, _, err := net.SplitHostPort(*listen)
+		if err != nil {
+			return fmt.Errorf("-listen: %v", err)
+		}
+		if ip := net.ParseIP(host); (ip == nil || !ip.IsLoopback()) && host != "localhost" && *token == "" {
+			return errors.New("-listen beyond this computer needs a -token (or $BGAMIX_TOKEN)")
+		}
+		if ln, err = net.Listen("tcp", *listen); err != nil {
+			return fmt.Errorf("the control API: %v", err)
+		}
+	}
+	s, err := engine.Start(p, filepath.Dir(path), engine.Options{Previews: *previews && ln != nil})
 	if err != nil {
 		return err
 	}
-	for _, r := range s.Recordings {
-		fmt.Println("recording to", r)
+	if ln != nil {
+		go http.Serve(ln, server.New(s, *token))
+		fmt.Printf("control API on http://%s/api/status\n", ln.Addr())
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -91,6 +116,8 @@ func run(args []string) error {
 			who := "mixer"
 			if e.Feed != "" {
 				who = "feed " + e.Feed
+			} else if e.Recording != "" {
+				who = e.Recording
 			}
 			fmt.Printf("%6.1f s  %-14s %s %s\n", time.Since(start).Seconds(), who, e.Kind, e.Text)
 			if e.Fatal {

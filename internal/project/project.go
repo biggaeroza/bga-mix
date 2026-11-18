@@ -23,15 +23,32 @@ const FormatVersion = 1
 
 // Project is a .bgamix file.
 type Project struct {
-	FormatVersion int         `json:"format_version"`
-	Name          string      `json:"name"`
-	Notes         string      `json:"notes,omitempty"`
-	Output        Output      `json:"output"`
-	Feeds         []Feed      `json:"feeds"`
-	Layouts       []Layout    `json:"layouts"`
-	StartLayout   string      `json:"start_layout,omitempty"` // default the first layout
-	Recordings    []Recording `json:"recordings,omitempty"`
+	FormatVersion int      `json:"format_version"`
+	Name          string   `json:"name"`
+	Notes         string   `json:"notes,omitempty"`
+	Output        Output   `json:"output"`
+	Feeds         []Feed   `json:"feeds"`
+	Layouts       []Layout `json:"layouts"`
+	StartLayout   string   `json:"start_layout,omitempty"` // default the first layout
+	// Transition is the default when switching layouts (a switch may override it).
+	Transition *Transition `json:"transition,omitempty"`
+	Recordings []Recording `json:"recordings,omitempty"`
 }
+
+// Transitions between layouts.
+const (
+	TransitionCut = "cut" // at once
+	TransitionMix = "mix" // boxes move, resize and fade from one layout to the other
+)
+
+// Transition is how one layout becomes the next.
+type Transition struct {
+	Kind      string  `json:"kind"`                 // cut, mix
+	DurationS float64 `json:"duration_s,omitempty"` // mix: default 0.5 s
+}
+
+// DefaultMixS is a mix's duration when none is given.
+const DefaultMixS = 0.5
 
 // Output is the mixed picture.
 type Output struct {
@@ -42,9 +59,10 @@ type Output struct {
 
 // Feed types.
 const (
-	FeedTest  = "test"  // a generated test pattern
-	FeedFile  = "file"  // a video file
-	FeedImage = "image" // a still image
+	FeedTest     = "test"     // a generated test pattern
+	FeedFile     = "file"     // a video file
+	FeedImage    = "image"    // a still image
+	FeedPlaylist = "playlist" // video files played in turn
 )
 
 // End behaviours of a file feed when it reaches its end (or its out point).
@@ -52,6 +70,9 @@ const (
 	EndLoop  = "loop"  // start again from the in point (default)
 	EndHold  = "hold"  // keep showing the last frame
 	EndBlack = "black" // show black
+	// EndReturn holds the last frame and switches back to the layout shown before the current
+	// one (a clip that runs once and returns to the cameras).
+	EndReturn = "return"
 )
 
 // Feed is one source.
@@ -66,7 +87,14 @@ type Feed struct {
 	// file
 	InS  float64 `json:"in_s,omitempty"`  // start here (seconds)
 	OutS float64 `json:"out_s,omitempty"` // stop here; 0: the end of the file
-	End  string  `json:"end,omitempty"`   // loop (default), hold, black
+	// End: what a file does at its end, or a playlist after its last item: loop (default),
+	// hold, black, return.
+	End string `json:"end,omitempty"`
+	// playlist: the files, played in order (relative to the project file)
+	Items []string `json:"items,omitempty"`
+	// ISO records this feed on its own, clean (before mixing), as well as the program. Its path
+	// may use {feed}.
+	ISO *Recording `json:"iso,omitempty"`
 }
 
 // Layout places feeds on the output.
@@ -96,6 +124,12 @@ type Recording struct {
 	Codec     string `json:"codec,omitempty"`     // h264 (default), h265
 	// BitrateKbps is the video bitrate; default by resolution (data in the engine).
 	BitrateKbps int `json:"bitrate_kbps,omitempty"`
+	// Manual: the recording waits to be started (otherwise it starts with the show).
+	Manual bool `json:"manual,omitempty"`
+	// Segments: a new file every SegmentS seconds or SegmentMB megabytes (0: no limit), named
+	// with -001, -002 … before the extension.
+	SegmentS  float64 `json:"segment_s,omitempty"`
+	SegmentMB float64 `json:"segment_mb,omitempty"`
 }
 
 // Problems is a list of validation problems, each with its path.
@@ -144,6 +178,22 @@ func (p *Project) Validate(dir string) error {
 			if f.Pattern != "" && !contains(Patterns, f.Pattern) {
 				add(at+".pattern", "one of %s", strings.Join(Patterns, ", "))
 			}
+		case FeedPlaylist:
+			if len(f.Items) == 0 {
+				add(at+".items", "give at least one file")
+			}
+			for k, it := range f.Items {
+				if strings.TrimSpace(it) == "" {
+					add(fmt.Sprintf("%s.items[%d]", at, k), "empty path")
+				} else if dir != "" {
+					if _, err := os.Stat(resolve(dir, it)); err != nil {
+						add(fmt.Sprintf("%s.items[%d]", at, k), "%v", err)
+					}
+				}
+			}
+			if !validEnd(f.End) {
+				add(at+".end", "loop, hold, black or return")
+			}
 		case FeedFile, FeedImage:
 			if f.Path == "" {
 				add(at+".path", "give the file")
@@ -156,12 +206,15 @@ func (p *Project) Validate(dir string) error {
 				if f.InS < 0 || f.OutS < 0 || (f.OutS > 0 && f.OutS <= f.InS) {
 					add(at, "in_s and out_s must not be negative, and out_s (0: the end) must come after in_s")
 				}
-				if f.End != "" && f.End != EndLoop && f.End != EndHold && f.End != EndBlack {
-					add(at+".end", "loop, hold or black")
+				if !validEnd(f.End) {
+					add(at+".end", "loop, hold, black or return")
 				}
 			}
 		default:
-			add(at+".type", "test, file or image")
+			add(at+".type", "test, file, image or playlist")
+		}
+		if f.ISO != nil {
+			validateRecording(f.ISO, at+".iso", add)
 		}
 	}
 	if len(p.Feeds) == 0 {
@@ -202,23 +255,64 @@ func (p *Project) Validate(dir string) error {
 	if p.StartLayout != "" && !layouts[p.StartLayout] {
 		add("start_layout", "no layout %q", p.StartLayout)
 	}
-	for i, r := range p.Recordings {
-		at := fmt.Sprintf("recordings[%d]", i)
-		if strings.TrimSpace(r.Path) == "" {
-			add(at+".path", "give the file")
+	if t := p.Transition; t != nil {
+		if t.Kind != TransitionCut && t.Kind != TransitionMix {
+			add("transition.kind", "cut or mix")
 		}
-		if r.Container != "" && r.Container != "mp4" && r.Container != "mkv" && r.Container != "mov" {
-			add(at+".container", "mp4, mkv or mov")
+		if t.DurationS < 0 || t.DurationS > 60 {
+			add("transition.duration_s", "0 to 60 s")
 		}
-		if r.Codec != "" && r.Codec != "h264" && r.Codec != "h265" {
-			add(at+".codec", "h264 or h265")
-		}
-		if r.BitrateKbps < 0 || r.BitrateKbps > 200000 {
-			add(at+".bitrate_kbps", "0 (automatic) to 200000")
-		}
+	}
+	for i := range p.Recordings {
+		validateRecording(&p.Recordings[i], fmt.Sprintf("recordings[%d]", i), add)
 	}
 	if len(ps) > 0 {
 		return ps
+	}
+	return nil
+}
+
+func validEnd(e string) bool {
+	return e == "" || e == EndLoop || e == EndHold || e == EndBlack || e == EndReturn
+}
+
+func validateRecording(r *Recording, at string, add func(string, string, ...any)) {
+	if strings.TrimSpace(r.Path) == "" {
+		add(at+".path", "give the file")
+	}
+	if r.Container != "" && r.Container != "mp4" && r.Container != "mkv" && r.Container != "mov" {
+		add(at+".container", "mp4, mkv or mov")
+	}
+	if r.Codec != "" && r.Codec != "h264" && r.Codec != "h265" {
+		add(at+".codec", "h264 or h265")
+	}
+	if r.BitrateKbps < 0 || r.BitrateKbps > 200000 {
+		add(at+".bitrate_kbps", "0 (automatic) to 200000")
+	}
+	if r.SegmentS < 0 || (r.SegmentS > 0 && r.SegmentS < 2) {
+		add(at+".segment_s", "0 (no limit) or at least 2 s")
+	}
+	if r.SegmentMB < 0 || (r.SegmentMB > 0 && r.SegmentMB < 1) {
+		add(at+".segment_mb", "0 (no limit) or at least 1 MB")
+	}
+}
+
+// Layout returns a layout by id (nil when there is none).
+func (p *Project) Layout(id string) *Layout {
+	for i := range p.Layouts {
+		if p.Layouts[i].ID == id {
+			return &p.Layouts[i]
+		}
+	}
+	return nil
+}
+
+// Feed returns a feed by id (nil when there is none).
+func (p *Project) Feed(id string) *Feed {
+	for i := range p.Feeds {
+		if p.Feeds[i].ID == id {
+			return &p.Feeds[i]
+		}
 	}
 	return nil
 }
