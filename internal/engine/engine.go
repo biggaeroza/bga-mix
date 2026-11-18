@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,11 @@ type Show struct {
 	byID     map[string]*feedRun
 	mixer    gst.Pipeline
 	mix      gst.Element
+	amixer   gst.Pipeline       // the sound mixer
+	audW     map[string]float64 // audio-follows-video weights now (0 to 1)
+	levels   map[string]Level   // meters: "program" and feeds
+	window   gst.Pipeline       // the program window on this computer (nil: closed)
+	listen   gst.Pipeline       // the program's sound on the speakers (nil: off)
 	layout   string
 	previous string
 	cur      map[string]PadProps // the placements applied (before blanking)
@@ -163,8 +169,19 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 	s.events, _ = s.Subscribe()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i, f := range p.Feeds {
-		fr := &feedRun{s: s, idx: i, f: f}
+	vi := 0
+	var withAudio []string
+	for _, f := range p.Feeds {
+		fr := &feedRun{s: s, idx: -1, f: f, mode: f.AudioMode(), volDB: f.VolumeDB, mute: f.Mute}
+		if project.HasVideo(f.Type) {
+			fr.idx = vi
+			vi++
+		}
+		// a feed's sound is carried when it may be heard or is recorded on its own
+		fr.audio = project.HasAudio(f.Type) && (fr.mode != project.AudioOff || f.ISO != nil || f.Type == project.FeedAudio)
+		if fr.audio {
+			withAudio = append(withAudio, f.ID)
+		}
 		s.feeds = append(s.feeds, fr)
 		s.byID[f.ID] = fr
 		fr.launchOrFail()
@@ -172,6 +189,33 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 	start := p.Start()
 	s.layout = start.ID
 	s.cur = Place(p, start)
+	s.audW = visible(start)
+	s.levels = map[string]Level{}
+	amixer, err := launch(AudioMixerPipeline(withAudio, s.runID))
+	if err != nil {
+		s.shutdownLocked()
+		return nil, fmt.Errorf("sound mixer: %w", err)
+	}
+	s.amixer = amixer
+	watch(ctx, amixer, func(msg *gst.Message) {
+		switch msg.Type() {
+		case gst.MessageElement:
+			if name := msg.Source().GetName(); strings.HasPrefix(name, "lv-") {
+				if lv, ok := parseLevel(msg.GetStructure().String()); ok {
+					s.mu.Lock()
+					s.levels[strings.TrimPrefix(name, "lv-")] = lv
+					s.mu.Unlock()
+				}
+			}
+		case gst.MessageError:
+			debug, err := msg.ParseError()
+			s.emit(Event{Kind: "error", Text: "sound mixer: " + errText(err, debug)})
+		}
+	})
+	if amixer.SetState(gst.StatePlaying) == gst.StateChangeFailure {
+		s.shutdownLocked()
+		return nil, errors.New("the sound mixer did not start")
+	}
 	mixer, err := launch(MixerPipeline(p, start, s.runID))
 	if err != nil {
 		s.shutdownLocked()
@@ -196,17 +240,30 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 	s.applyLocked()
 	if o.Previews {
 		s.startPreview("program", ProgramChannel(s.runID), false)
-		for _, f := range p.Feeds {
+		for _, f := range VideoFeeds(p) {
 			s.startPreview(f.ID, FeedChannel(s.runID, f.ID), Held(f))
 		}
 	}
 	for i, r := range p.Recordings {
-		s.recs = append(s.recs, &recRun{s: s, label: fmt.Sprintf("program-%d", i+1), r: r, channel: ProgramChannel(s.runID)})
+		rr := &recRun{s: s, label: fmt.Sprintf("program-%d", i+1), r: r, channel: ProgramChannel(s.runID)}
+		if !r.NoAudio {
+			rr.achannel = ProgramAudioChannel(s.runID)
+		}
+		s.recs = append(s.recs, rr)
 	}
 	for _, f := range p.Feeds {
-		if f.ISO != nil {
-			s.recs = append(s.recs, &recRun{s: s, label: "iso-" + f.ID, feed: f.ID, r: *f.ISO, channel: FeedChannel(s.runID, f.ID), held: Held(f)})
+		if f.ISO != nil && project.HasVideo(f.Type) {
+			rr := &recRun{s: s, label: "iso-" + f.ID, feed: f.ID, r: *f.ISO, channel: FeedChannel(s.runID, f.ID), held: Held(f)}
+			if !f.ISO.NoAudio && s.byID[f.ID].audio {
+				rr.achannel = AudioChannel(s.runID, f.ID)
+			}
+			s.recs = append(s.recs, rr)
 		}
+	}
+	for i := range p.Streams {
+		st := p.Streams[i]
+		s.recs = append(s.recs, &recRun{s: s, label: fmt.Sprintf("stream-%d", i+1), stream: &st,
+			r: project.Recording{Manual: st.Manual, Encoder: st.Encoder, Codec: st.Codec}})
 	}
 	for _, rr := range s.recs {
 		if !rr.r.Manual {
@@ -215,7 +272,7 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 			}
 		}
 	}
-	s.emit(Event{Kind: "started", Text: fmt.Sprintf("%d feed(s), layout %q, %d recording(s)", len(p.Feeds), start.ID, len(s.recs))})
+	s.emit(Event{Kind: "started", Text: fmt.Sprintf("%d feed(s), layout %q, %d recording(s), %d stream(s)", len(p.Feeds), start.ID, len(s.recs)-len(p.Streams), len(p.Streams))})
 	return s, nil
 }
 
@@ -251,6 +308,11 @@ func (s *Show) shutdownLocked() {
 	if s.mixer != nil {
 		s.mixer.SetState(gst.StateNull)
 	}
+	for _, pl := range []gst.Pipeline{s.amixer, s.window, s.listen} {
+		if pl != nil {
+			pl.SetState(gst.StateNull)
+		}
+	}
 	for _, fr := range s.feeds {
 		if fr.retry != nil {
 			fr.retry.Stop()
@@ -265,7 +327,7 @@ func (s *Show) shutdownLocked() {
 
 // pad is a feed's compositor input.
 func (s *Show) pad(i int) gst.Pad {
-	if s.mix == nil {
+	if s.mix == nil || i < 0 {
 		return nil
 	}
 	return s.mix.GetStaticPad("sink_" + strconv.Itoa(i))
@@ -290,6 +352,80 @@ func (s *Show) applyLocked() {
 		pad.SetObjectProperty("zorder", uint32(pp.Z))
 		pad.SetObjectProperty("alpha", a)
 	}
+	s.applyAudioLocked()
+}
+
+// visible gives each feed shown by a layout (a box with some opacity) the weight 1: the
+// audio-follows-video weights the layout leads to.
+func visible(l *project.Layout) map[string]float64 {
+	w := map[string]float64{}
+	for _, b := range l.Boxes {
+		if b.Alpha == nil || *b.Alpha > 0 {
+			w[b.Feed] = 1
+		}
+	}
+	return w
+}
+
+// gain is a feed's fader: its level, times its audio-follows-video weight when it follows.
+func (s *Show) gain(fr *feedRun) float64 {
+	if fr.mode == project.AudioOff {
+		return 0
+	}
+	g := math.Pow(10, fr.volDB/20)
+	if fr.mode == project.AudioFollow {
+		g *= s.audW[fr.f.ID]
+	}
+	return g
+}
+
+// applyAudioLocked sets every feed's fader and mute.
+func (s *Show) applyAudioLocked() {
+	if s.amixer == nil {
+		return
+	}
+	for _, fr := range s.feeds {
+		if !fr.audio {
+			continue
+		}
+		if v := s.amixer.GetByName("vol-" + fr.f.ID); v != nil {
+			v.SetObjectProperty("volume", s.gain(fr))
+			v.SetObjectProperty("mute", fr.mute)
+		}
+	}
+}
+
+// AudioCommand changes a feed's sound live: its level (dB, -60 to +12), mute, and mode
+// (follow, on, off); nil and "" leave a setting as it is.
+func (s *Show) AudioCommand(id string, volumeDB *float64, mute *bool, mode string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fr := s.byID[id]
+	if fr == nil {
+		return fmt.Errorf("no feed %q", id)
+	}
+	if !fr.audio {
+		return fmt.Errorf("%q carries no sound in this show (a picture-only feed, or its sound was off when the show started)", id)
+	}
+	if volumeDB != nil {
+		if *volumeDB < -60 || *volumeDB > 12 {
+			return errors.New("the level is -60 to +12 dB")
+		}
+		fr.volDB = *volumeDB
+	}
+	if mute != nil {
+		fr.mute = *mute
+	}
+	switch mode {
+	case "":
+	case project.AudioFollow, project.AudioOn, project.AudioOff:
+		fr.mode = mode
+	default:
+		return fmt.Errorf("unknown audio mode %q (follow, on, off)", mode)
+	}
+	s.applyAudioLocked()
+	s.emit(Event{Feed: id, Kind: "audio", Text: fmt.Sprintf("%s, %+.1f dB%s", fr.mode, fr.volDB, map[bool]string{true: ", muted"}[fr.mute])})
+	return nil
 }
 
 // SetLayout switches to a layout: with t nil, by the show's default transition (a cut when it
@@ -324,10 +460,12 @@ func (s *Show) setLayoutLocked(id string, t *project.Transition) error {
 	}
 	s.layout = id
 	target := Place(s.p, l)
+	targetW := visible(l)
 	s.transGen++
 	gen := s.transGen
 	if kind == project.TransitionCut || dur <= 0 {
 		s.cur = target
+		s.audW = targetW
 		s.transOn = false
 		s.applyLocked()
 		s.emit(Event{Kind: "layout", Text: id + " (cut)"})
@@ -353,6 +491,10 @@ func (s *Show) setLayoutLocked(id string, t *project.Transition) error {
 			from[k+"\x00to"] = b
 		}
 	}
+	fromW := map[string]float64{}
+	for k, v := range s.audW {
+		fromW[k] = v
+	}
 	s.transOn = true
 	s.emit(Event{Kind: "layout", Text: fmt.Sprintf("%s (mix %.2f s)", id, dur)})
 	frames := max(1, int(math.Ceil(dur*float64(s.p.Output.FPS))))
@@ -377,11 +519,15 @@ func (s *Show) setLayoutLocked(id string, t *project.Transition) error {
 				}
 				cur[f] = Lerp(from[f], to, e)
 			}
+			w := map[string]float64{}
+			for _, fr := range s.feeds {
+				w[fr.f.ID] = fromW[fr.f.ID] + e*(targetW[fr.f.ID]-fromW[fr.f.ID])
+			}
 			if k == frames {
-				cur = target
+				cur, w = target, targetW
 				s.transOn = false
 			}
-			s.cur = cur
+			s.cur, s.audW = cur, w
 			s.applyLocked()
 			s.mu.Unlock()
 		}
@@ -393,7 +539,11 @@ func (s *Show) setLayoutLocked(id string, t *project.Transition) error {
 
 type feedRun struct {
 	s        *Show
-	idx      int
+	idx      int     // the compositor input (-1: sound only)
+	audio    bool    // its sound is carried to the sound mixer
+	mode     string  // follow, on, off
+	volDB    float64 // its level
+	mute     bool
 	f        project.Feed
 	pl       gst.Pipeline
 	gen      int
@@ -419,16 +569,31 @@ func (fr *feedRun) launch() error {
 	s := fr.s
 	fr.teardown()
 	fr.state = "starting"
-	pl, err := launch(FeedPipeline(fr.f, fr.item, s.p.Output, s.dir, FeedChannel(s.runID, fr.f.ID)))
+	ach := ""
+	if fr.audio {
+		ach = AudioChannel(s.runID, fr.f.ID)
+	}
+	pl, err := launch(FeedPipeline(fr.f, fr.item, s.p.Output, s.dir, FeedChannel(s.runID, fr.f.ID), ach))
 	if err != nil {
 		return err
+	}
+	if fr.f.Type == project.FeedStream {
+		// an RTSP source's buffer (its default is 2 s) is set as uridecodebin makes it
+		if dec := pl.GetByName("dec"); dec != nil {
+			ms := uint32(latency(fr.f.LatencyMS))
+			dec.Connect("source-setup", func(_ gst.Element, src gst.Element) {
+				if f := src.GetFactory(); f != nil && f.GetName() == "rtspsrc" {
+					src.SetObjectProperty("latency", ms)
+				}
+			})
+		}
 	}
 	fr.gen++
 	gen := fr.gen
 	ctx, cancel := context.WithCancel(s.ctx)
 	fr.pl, fr.stopW = pl, cancel
 	watch(ctx, pl, func(msg *gst.Message) { fr.handle(msg, gen) })
-	if fr.f.Type == project.FeedFile && (fr.f.InS > 0 || fr.f.OutS > 0) {
+	if fr.f.Type == project.FeedFile && (fr.f.InS > 0 || fr.f.OutS > 0 || fr.segmentLoop()) {
 		if pl.SetState(gst.StatePaused) == gst.StateChangeFailure {
 			return errors.New("cannot open the file")
 		}
@@ -460,15 +625,54 @@ func (fr *feedRun) teardown() {
 	}
 }
 
+// segmentLoop reports whether a file feed loops by segment seeks: its seeks carry the segment
+// flag, so that at its end (or out point) it posts "segment done" instead of ending, and the
+// next pass is queued without a flush. A flushing seek back to the start, as first done, stalled
+// the sound for seconds after each loop (the audio sink, which does not wait for prerolling so
+// that files without sound play, kept the pipeline's old clock base); looping this way is also
+// seamless.
+func (fr *feedRun) segmentLoop() bool { return fr.f.Type == project.FeedFile && fr.loops() }
+
 // seekIn seeks a file feed to its in point, with its out point as the stop.
 func (fr *feedRun) seekIn() bool { return fr.seekTo(fr.f.InS) }
 
-func (fr *feedRun) seekTo(pos float64) bool {
-	stopType, stop := gst.SeekTypeNone, int64(-1)
+func (fr *feedRun) stop() (gst.SeekType, int64) {
 	if fr.f.Type == project.FeedFile && fr.f.OutS > 0 {
-		stopType, stop = gst.SeekTypeSet, int64(fr.f.OutS*float64(time.Second))
+		return gst.SeekTypeSet, int64(fr.f.OutS * float64(time.Second))
 	}
-	return fr.pl.Seek(1.0, gst.FormatTime, gst.SeekFlagFlush|gst.SeekFlagAccurate, gst.SeekTypeSet, int64(pos*float64(time.Second)), stopType, stop)
+	return gst.SeekTypeNone, -1
+}
+
+func (fr *feedRun) seekTo(pos float64) bool {
+	stopType, stop := fr.stop()
+	flags := gst.SeekFlagFlush | gst.SeekFlagAccurate
+	if fr.segmentLoop() {
+		flags |= gst.SeekFlagSegment
+	}
+	return fr.pl.Seek(1.0, gst.FormatTime, flags, gst.SeekTypeSet, int64(pos*float64(time.Second)), stopType, stop)
+}
+
+// seekPaused seeks a running file: paused for the seek, then playing again when it was. A
+// flushing seek while playing silenced the sound for seconds (see segmentLoop); going through
+// PAUSED gives every sink, the audio one too, the pipeline's new clock base.
+func (fr *feedRun) seekPaused(pos float64) bool {
+	playing := fr.state == "playing"
+	if playing {
+		fr.pl.SetState(gst.StatePaused)
+		fr.pl.GetState(2 * gst.Second)
+	}
+	ok := fr.seekTo(pos)
+	fr.pl.GetState(2 * gst.Second)
+	if playing {
+		fr.pl.SetState(gst.StatePlaying)
+	}
+	return ok
+}
+
+// loopAgain queues the next pass of a looping file: a segment seek without a flush.
+func (fr *feedRun) loopAgain() bool {
+	stopType, stop := fr.stop()
+	return fr.pl.Seek(1.0, gst.FormatTime, gst.SeekFlagSegment|gst.SeekFlagAccurate, gst.SeekTypeSet, int64(fr.f.InS*float64(time.Second)), stopType, stop)
 }
 
 func (fr *feedRun) handle(msg *gst.Message, gen int) {
@@ -481,11 +685,20 @@ func (fr *feedRun) handle(msg *gst.Message, gen int) {
 	switch msg.Type() {
 	case gst.MessageEOS:
 		fr.onEnd()
+	case gst.MessageSegmentDone:
+		if fr.segmentLoop() && fr.loopAgain() {
+			s.emit(Event{Feed: fr.f.ID, Kind: "looped"})
+		} else {
+			fr.onEnd()
+		}
 	case gst.MessageError:
 		debug, err := msg.ParseError()
 		fr.fail(errText(err, debug))
 	case gst.MessageWarning:
 		debug, err := msg.ParseWarning()
+		if strings.Contains(errText(err, debug), "Delayed linking failed") {
+			return // the sound branch of a file without sound: nothing is wrong
+		}
 		s.emit(Event{Feed: fr.f.ID, Kind: "warning", Text: errText(err, debug)})
 	}
 }
@@ -495,6 +708,10 @@ func (fr *feedRun) loops() bool { return fr.f.End == "" || fr.f.End == project.E
 // onEnd handles a file's end (or its out point) and a playlist item's end.
 func (fr *feedRun) onEnd() {
 	s := fr.s
+	if fr.f.Type == project.FeedStream || fr.f.Type == project.FeedCamera || fr.f.Type == project.FeedAudio {
+		fr.fail("the source ended") // a live source that ends has gone away: reconnect
+		return
+	}
 	switch {
 	case fr.f.Type == project.FeedPlaylist && fr.item+1 < len(fr.f.Items):
 		fr.item++
@@ -599,7 +816,9 @@ func (s *Show) FeedCommand(id, cmd string, seconds float64) error {
 		fr.pl.SetState(gst.StatePaused)
 		fr.state = "paused"
 	case "restart":
-		return fr.restartLocked()
+		if err := fr.restartLocked(); err != nil {
+			return err
+		}
 	case "seek":
 		if !isFile || fr.pl == nil {
 			return errors.New("only a running file or playlist seeks")
@@ -611,7 +830,7 @@ func (s *Show) FeedCommand(id, cmd string, seconds float64) error {
 				pos = math.Min(fr.f.OutS, pos)
 			}
 		}
-		if !fr.seekTo(math.Max(0, pos)) {
+		if !fr.seekPaused(math.Max(0, pos)) {
 			return errors.New("the seek failed")
 		}
 		if fr.state == "ended" {
@@ -647,7 +866,7 @@ func (fr *feedRun) restartLocked() error {
 	}
 	fr.item = 0
 	if fr.f.Type == project.FeedFile && fr.pl != nil {
-		if !fr.seekIn() {
+		if !fr.seekPaused(fr.f.InS) {
 			return errors.New("the seek failed")
 		}
 		fr.pl.SetState(gst.StatePlaying)
@@ -665,22 +884,28 @@ func (fr *feedRun) restartLocked() error {
 // ---- recordings --------------------------------------------------------------------------
 
 type recRun struct {
-	s       *Show
-	label   string
-	feed    string // an ISO recording's feed
-	r       project.Recording
-	channel string
-	held    bool
-	pl      gst.Pipeline
-	stopW   context.CancelFunc
-	eos     chan struct{}
-	state   string // idle, recording, paused, stopping, failed
-	path    string
-	files   []string
-	started time.Time
-	pausedT time.Duration
-	pausedA time.Time
-	lastErr string
+	s        *Show
+	label    string
+	feed     string          // an ISO recording's feed
+	stream   *project.Stream // a stream (else a recording)
+	r        project.Recording
+	channel  string
+	achannel string // the sound recorded ("": none)
+	held     bool
+	encoder  string // the encoder kind in use
+	retry    *time.Timer
+	failures int
+	user     bool // stopped by the operator (a stream is not reconnected)
+	pl       gst.Pipeline
+	stopW    context.CancelFunc
+	eos      chan struct{}
+	state    string // idle, recording, paused, stopping, failed
+	path     string
+	files    []string
+	started  time.Time
+	pausedT  time.Duration
+	pausedA  time.Time
+	lastErr  string
 }
 
 func (rr *recRun) startLocked() error {
@@ -688,12 +913,23 @@ func (rr *recRun) startLocked() error {
 	if rr.state == "recording" || rr.state == "paused" || rr.state == "stopping" {
 		return errors.New("already recording")
 	}
-	seg := rr.r.SegmentS > 0 || rr.r.SegmentMB > 0
-	path := FreePath(RecordingPath(rr.r, s.p, rr.feed, s.dir, time.Now()), seg)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	kind, note := ChooseEncoder(rr.r.Encoder, rr.r.Codec)
+	if note != "" {
+		s.emit(Event{Recording: rr.label, Kind: "warning", Text: note})
 	}
-	pl, err := launch(RecordingPipeline(rr.r, s.p.Output, rr.channel, rr.held, path))
+	rr.encoder, rr.user = kind, false
+	var desc, path string
+	if rr.stream != nil {
+		desc, path = StreamPipeline(*rr.stream, s.p.Output, s.runID, kind), StreamDisplay(*rr.stream)
+	} else {
+		seg := rr.r.SegmentS > 0 || rr.r.SegmentMB > 0
+		path = FreePath(RecordingPath(rr.r, s.p, rr.feed, s.dir, time.Now()), seg)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		desc = RecordingPipeline(rr.r, s.p.Output, rr.channel, rr.held, rr.achannel, kind, path)
+	}
+	pl, err := launch(desc)
 	if err != nil {
 		return err
 	}
@@ -711,26 +947,86 @@ func (rr *recRun) startLocked() error {
 				rr.lastErr = errText(err, debug)
 				rr.state = "failed"
 				pl.SetState(gst.StateNull)
+				if rr.stream != nil && !s.stopped {
+					rr.reconnectLocked()
+				}
 			}
 			s.mu.Unlock()
 			s.emit(Event{Recording: rr.label, Kind: "error", Text: errText(err, debug)})
+		case gst.MessageWarning: // srtsink reports a lost receiver this way, and reconnects
+			debug, err := msg.ParseWarning()
+			s.mu.Lock()
+			if rr.pl == pl {
+				rr.lastErr = errText(err, debug)
+			}
+			s.mu.Unlock()
+			s.emit(Event{Recording: rr.label, Kind: "warning", Text: errText(err, debug)})
 		}
 	})
 	if pl.SetState(gst.StatePlaying) == gst.StateChangeFailure {
 		cancel()
 		pl.SetState(gst.StateNull)
-		return errors.New("the recording did not start")
+		return errors.New("did not start")
 	}
 	rr.state, rr.started, rr.pausedT, rr.lastErr = "recording", time.Now(), 0, ""
-	rr.files = append(rr.files, path)
-	s.emit(Event{Recording: rr.label, Kind: "recording", Text: path})
+	if rr.stream == nil {
+		rr.files = append(rr.files, path)
+	}
+	s.emit(Event{Recording: rr.label, Kind: "recording", Text: path + " (" + kind + " encoder)"})
 	return nil
+}
+
+// reconnectLocked starts a failed stream again after a back-off (1 s doubling to 30 s; reset
+// after 10 s of good streaming).
+func (rr *recRun) reconnectLocked() {
+	s := rr.s
+	if !rr.started.IsZero() && time.Since(rr.started) > stableAfter {
+		rr.failures = 0
+	}
+	rr.failures++
+	delay := min(retryFirst<<min(rr.failures-1, 5), retryMax)
+	rr.state = "reconnecting"
+	s.emit(Event{Recording: rr.label, Kind: "restarting", Text: fmt.Sprintf("in %.0f s", delay.Seconds())})
+	if rr.retry != nil {
+		rr.retry.Stop()
+	}
+	rr.retry = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.stopped || rr.user || rr.state != "reconnecting" {
+			return
+		}
+		rr.stopW()
+		rr.state = "idle"
+		if err := rr.startLocked(); err != nil {
+			rr.lastErr = err.Error()
+			rr.reconnectLocked()
+		}
+	})
+}
+
+// StreamDisplay is a stream's URL without its key (for the status and the log).
+func StreamDisplay(st project.Stream) string {
+	if st.Key != "" {
+		return strings.TrimSuffix(st.URL, "/") + "/•••"
+	}
+	return st.URL
 }
 
 // stop finishes the recording cleanly (end-of-stream through the muxer, up to 10 s).
 func (rr *recRun) stop() {
 	s := rr.s
 	s.mu.Lock()
+	rr.user = true
+	if rr.retry != nil {
+		rr.retry.Stop()
+	}
+	if rr.state == "reconnecting" {
+		rr.state = "idle"
+		s.mu.Unlock()
+		s.emit(Event{Recording: rr.label, Kind: "stopped"})
+		return
+	}
 	if rr.state != "recording" && rr.state != "paused" {
 		s.mu.Unlock()
 		return
@@ -741,22 +1037,27 @@ func (rr *recRun) stop() {
 	}
 	rr.state = "stopping"
 	s.mu.Unlock()
-	pl.SendEvent(gst.NewEventEOS())
-	select {
-	case <-eos:
-	case <-time.After(10 * time.Second):
-		s.emit(Event{Recording: rr.label, Kind: "warning", Text: "did not finish within 10 s: stopped anyway"})
-	}
-	s.mu.Lock()
+	if rr.stream == nil {
+		// end-of-stream finishes the file; it is sent from a goroutine because a sink that is
+		// stuck (a full disk, a network sink retrying) can block it
+		go pl.SendEvent(gst.NewEventEOS())
+		select {
+		case <-eos:
+		case <-time.After(10 * time.Second):
+			s.emit(Event{Recording: rr.label, Kind: "warning", Text: "did not finish within 10 s: stopped anyway"})
+		}
+	} // a stream needs no finishing: srtsink, while reconnecting, never takes end-of-stream
 	pl.SetState(gst.StateNull)
+	s.mu.Lock()
 	rr.stopW()
 	rr.state = "idle"
 	s.mu.Unlock()
 	s.emit(Event{Recording: rr.label, Kind: "stopped", Text: path})
 }
 
-// RecordingCommand starts, stops, pauses or resumes a recording (by its label: "program-1" …,
-// "iso-<feed>"). A paused recording leaves the paused time out of the file.
+// RecordingCommand starts, stops, pauses or resumes a recording or stream (by its label:
+// "program-1" …, "iso-<feed>", "stream-1" …). A paused recording leaves the paused time out of
+// the file; streams do not pause.
 func (s *Show) RecordingCommand(label, cmd string) error {
 	s.mu.Lock()
 	var rr *recRun
@@ -783,6 +1084,9 @@ func (s *Show) RecordingCommand(label, cmd string) error {
 		return nil
 	case "pause":
 		defer s.mu.Unlock()
+		if rr.stream != nil {
+			return errors.New("a stream does not pause (stop it, or cut to a holding layout)")
+		}
 		if rr.state != "recording" {
 			return errors.New("not recording")
 		}
@@ -870,6 +1174,24 @@ type FeedStatus struct {
 	Items     int     `json:"items,omitempty"`
 	Error     string  `json:"error,omitempty"`
 	Restarts  int     `json:"restarts,omitempty"`
+	// sound (feeds carrying it)
+	HasAudio bool    `json:"has_audio,omitempty"`
+	Audio    string  `json:"audio,omitempty"` // follow, on, off
+	VolumeDB float64 `json:"volume_db"`
+	Mute     bool    `json:"mute,omitempty"`
+	Heard    float64 `json:"heard,omitempty"` // its gain into the mix now (0: not heard)
+	Level    *Level  `json:"level,omitempty"`
+}
+
+// StreamStatus is a stream's state.
+type StreamStatus struct {
+	Label    string  `json:"label"`
+	Name     string  `json:"name,omitempty"`
+	URL      string  `json:"url"` // without the key
+	State    string  `json:"state"`
+	ElapsedS float64 `json:"elapsed_s,omitempty"`
+	Encoder  string  `json:"encoder,omitempty"`
+	Error    string  `json:"error,omitempty"`
 }
 
 // RecordingStatus is a recording's state.
@@ -882,6 +1204,7 @@ type RecordingStatus struct {
 	ElapsedS float64  `json:"elapsed_s,omitempty"` // recorded time (pauses left out)
 	Bytes    int64    `json:"bytes,omitempty"`     // the current file's size
 	Error    string   `json:"error,omitempty"`
+	Encoder  string   `json:"encoder,omitempty"`
 }
 
 // LayoutInfo names a layout.
@@ -903,6 +1226,10 @@ type Status struct {
 	UptimeS       float64           `json:"uptime_s"`
 	Stopped       bool              `json:"stopped,omitempty"`
 	Previews      bool              `json:"previews,omitempty"`
+	Streams       []StreamStatus    `json:"streams"`
+	ProgramLevel  *Level            `json:"program_level,omitempty"`
+	Window        bool              `json:"window,omitempty"`
+	Listen        bool              `json:"listen,omitempty"`
 }
 
 // Status reports the show's state.
@@ -930,10 +1257,35 @@ func (s *Show) Status() Status {
 				fs.DurationS = float64(d) / 1e9
 			}
 		}
+		if fr.audio {
+			fs.HasAudio, fs.Audio, fs.VolumeDB, fs.Mute, fs.Heard = true, fr.mode, fr.volDB, fr.mute, s.gain(fr)
+			if fr.mute {
+				fs.Heard = 0
+			}
+			if lv, ok := s.levels[fr.f.ID]; ok && time.Since(lv.At) < time.Second {
+				fs.Level = &lv
+			}
+		}
 		st.Feeds = append(st.Feeds, fs)
 	}
+	st.Streams = []StreamStatus{}
+	if lv, ok := s.levels["program"]; ok && time.Since(lv.At) < time.Second {
+		st.ProgramLevel = &lv
+	}
+	st.Window, st.Listen = s.window != nil, s.listen != nil
 	for _, rr := range s.recs {
-		rs := RecordingStatus{Label: rr.label, Feed: rr.feed, State: rr.state, Files: rr.files, Error: rr.lastErr}
+		if rr.stream != nil {
+			ss := StreamStatus{Label: rr.label, Name: rr.stream.Name, URL: StreamDisplay(*rr.stream), State: rr.state, Error: rr.lastErr, Encoder: rr.encoder}
+			if ss.State == "" {
+				ss.State = "idle"
+			}
+			if rr.state == "recording" {
+				ss.State, ss.ElapsedS = "live", time.Since(rr.started).Seconds()
+			}
+			st.Streams = append(st.Streams, ss)
+			continue
+		}
+		rs := RecordingStatus{Label: rr.label, Feed: rr.feed, State: rr.state, Files: rr.files, Error: rr.lastErr, Encoder: rr.encoder}
 		if rs.State == "" {
 			rs.State = "idle"
 		}

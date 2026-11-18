@@ -3,7 +3,19 @@
 
 import { api, h, url, duration, basename, join, dirname, relative, uniqueID, colour, toast, put } from "./api.js";
 
-const TYPES = { test: "Test pattern", file: "Video file", image: "Still image", playlist: "Playlist" };
+const TYPES = { test: "Test pattern", file: "Video file", image: "Still image", playlist: "Playlist",
+  camera: "Camera", stream: "Network stream", audio: "Sound input" };
+const HAS_AUDIO = new Set(["file", "playlist", "stream", "audio"]);
+export const hasVideo = (f) => f.type !== "audio";
+const AUDIO_MODES = { follow: "Follows the picture (heard while on air)", on: "Always heard", off: "Off" };
+
+let devices = null; // {cameras, audio_inputs}, fetched once per page
+async function getDevices(refresh) {
+  if (!devices || refresh) {
+    try { devices = await api("devices"); } catch { devices = { cameras: [], audio_inputs: [] }; }
+  }
+  return devices;
+}
 const ENDS = { loop: "Loop", hold: "Hold the last frame", black: "Go black", return: "Return to the previous layout" };
 
 // mediaPath is a feed's file as the server sees it (relative paths are against the show file).
@@ -50,6 +62,8 @@ export function render(el, ctx) {
     const nf = { id: type, name: TYPES[type], type };
     if (type === "test") nf.pattern = "smpte";
     if (type === "playlist") nf.items = [];
+    if (type === "stream") nf.url = "srt://0.0.0.0:9000?mode=listener";
+    if (type === "audio") nf.pattern = "tone";
     addFeed(ctx, nf);
   };
   el.append(h("div.split", {},
@@ -59,7 +73,8 @@ export function render(el, ctx) {
           h("option", { value: "" }, "+ Add…"), Object.entries(TYPES).map(([k, v]) => h("option", { value: k }, v)))),
       p.feeds.length ? p.feeds.map((x, i) => h("button.item", { class: x.id === st.sel.feed ? "active" : "", onclick: () => { st.sel.feed = x.id; ctx.draw(); } },
         h("span.swatch", { style: { background: colour(x.id) } }),
-        h("span.grow", {}, h("div", {}, x.name || x.id), h("div.dim", {}, TYPES[x.type] || x.type, x.path ? " · " + basename(x.path) : "", x.items ? ` · ${x.items.length} file(s)` : "")),
+        h("span.grow", {}, h("div", {}, x.name || x.id), h("div.dim", {}, TYPES[x.type] || x.type, x.path ? " · " + basename(x.path) : "", x.items ? ` · ${x.items.length} file(s)` : "",
+          x.url ? " · " + x.url.replace(/^(\w+:\/\/[^/?]*).*/, "$1") : "", x.device ? " · " + basename(x.device) : "")),
         h("span.updown", {},
           h("button.icon", { title: "Up", disabled: i === 0, onclick: (e) => { e.stopPropagation(); ctx.edit((p) => p.feeds.splice(i - 1, 0, p.feeds.splice(i, 1)[0])); } }, "▲"),
           h("button.icon", { title: "Down", disabled: i === p.feeds.length - 1, onclick: (e) => { e.stopPropagation(); ctx.edit((p) => p.feeds.splice(i + 1, 0, p.feeds.splice(i, 1)[0])); } }, "▼")))) :
@@ -100,9 +115,12 @@ function editor(ctx, f) {
         const t = e.target.value;
         ctx.edit(() => {
           f.type = t;
-          for (const k of ["pattern", "path", "in_s", "out_s", "end", "items"]) delete f[k];
+          for (const k of ["pattern", "path", "in_s", "out_s", "end", "items", "device", "width", "height", "fps", "url", "latency_ms", "audio", "volume_db", "mute"]) delete f[k];
           if (t === "test") f.pattern = "smpte";
           if (t === "playlist") f.items = [];
+          if (t === "stream") f.url = "srt://0.0.0.0:9000?mode=listener";
+          if (t === "audio") f.pattern = "tone";
+          if (t === "audio") { delete f.iso; for (const l of p.layouts) l.boxes = l.boxes.filter((b) => b.feed !== f.id); }
         });
       } }, Object.entries(TYPES).map(([k, v]) => h("option", { value: k, selected: k === f.type }, v))))),
   ];
@@ -139,9 +157,53 @@ function editor(ctx, f) {
         h("span.dim", {}, "or add files from the Media tab"))),
       h("div.grid3", {}, field("At the end", endSelect(f, set))));
   }
+  if (f.type === "camera") {
+    const sel = h("select", { onchange: (e) => set("device", e.target.value) }, h("option", { value: f.device || "" }, f.device || "/dev/video0 (the first camera)"));
+    getDevices().then((d) => put(sel, h("option", { value: "", selected: !f.device }, "/dev/video0 (the first camera)"),
+      d.cameras.map((c) => h("option", { value: c.device, selected: c.device === f.device }, c.name)),
+      f.device && !d.cameras.some((c) => c.device === f.device) ? h("option", { value: f.device, selected: true }, f.device + " (not connected)") : null));
+    parts.push(h("div.grid2", {},
+      field("Camera", h("div.row", {}, sel, h("button", { title: "Look for cameras again", onclick: async () => { await getDevices(true); ctx.draw(); } }, "Refresh"))),
+      field("Picture asked of it", h("div.row", {},
+        h("input.num", { type: "number", min: 0, step: 2, value: f.width || "", placeholder: "width", onchange: (e) => set("width", +e.target.value || undefined), "aria-label": "Width" }), "×",
+        h("input.num", { type: "number", min: 0, step: 2, value: f.height || "", placeholder: "height", onchange: (e) => set("height", +e.target.value || undefined), "aria-label": "Height" }), "at",
+        h("input.num", { type: "number", min: 0, value: f.fps || "", placeholder: "fps", onchange: (e) => set("fps", +e.target.value || undefined), "aria-label": "Frame rate" })),
+        "empty: the camera's own; raw or MJPEG, whichever it gives")));
+  }
+  if (f.type === "stream") {
+    parts.push(h("div.grid2", {},
+      field("URL", h("input", { type: "text", value: f.url || "", placeholder: "srt://0.0.0.0:9000?mode=listener", oninput: (e) => set("url", e.target.value.trim()) }),
+        "srt://host:port (?mode=listener to wait for the sender), rtsp://camera/stream, udp://0.0.0.0:5000 (MPEG-TS), rtmp://…, http(s)://… (HLS)"),
+      field("Buffer (ms)", h("input.num", { type: "number", min: 0, max: 10000, step: 20, value: f.latency_ms || "", placeholder: "200", onchange: (e) => set("latency_ms", +e.target.value || undefined) }),
+        "SRT and RTSP: more rides out a poor network, less is closer to live")),
+      h("p.dim", {}, "A stream that drops or ends is reconnected (after 1 s, 2 s, 4 s … up to 30 s); its box is left transparent meanwhile."));
+  }
+  if (f.type === "audio") {
+    const sel = h("select", { onchange: (e) => {
+      const v = e.target.value;
+      ctx.edit(() => { if (v === "\u0000tone") { f.pattern = "tone"; delete f.device; } else { delete f.pattern; if (v) f.device = v; else delete f.device; } });
+    } }, h("option", {}, "…"));
+    getDevices().then((d) => put(sel,
+      h("option", { value: "\u0000tone", selected: f.pattern === "tone" }, "Test tone (440 Hz)"),
+      h("option", { value: "", selected: f.pattern !== "tone" && !f.device }, "The system's input"),
+      d.audio_inputs.map((a) => h("option", { value: a.device, selected: a.device === f.device }, a.name)),
+      f.device && !d.audio_inputs.some((a) => a.device === f.device) ? h("option", { value: f.device, selected: true }, f.device + " (not found)") : null));
+    parts.push(h("div.grid2", {}, field("Input", h("div.row", {}, sel, h("button", { onclick: async () => { await getDevices(true); ctx.draw(); } }, "Refresh")),
+      "a microphone, a line input, or the monitor of an output")),
+      h("p.dim", {}, "Sound only: it has no picture, so it is not placed in layouts. It is heard always unless set otherwise below."));
+  }
+  if (HAS_AUDIO.has(f.type)) {
+    const def = f.type === "audio" ? "on" : "follow";
+    parts.push(h("fieldset", {}, h("legend", {}, "Sound"), h("div.grid3", {},
+      field("Heard", h("select", { onchange: (e) => set("audio", e.target.value === def ? undefined : e.target.value) },
+        Object.entries(AUDIO_MODES).map(([k, v]) => h("option", { value: k, selected: (f.audio || def) === k }, v)))),
+      field("Level (dB)", h("input.num", { type: "number", min: -60, max: 12, step: 0.5, value: f.volume_db ?? "", placeholder: "0",
+        onchange: (e) => set("volume_db", e.target.value === "" || +e.target.value === 0 ? undefined : Math.max(-60, Math.min(12, +e.target.value))) }), "-60 to +12; changed live in the switcher"),
+      h("label.field.check", {}, h("input", { type: "checkbox", checked: !!f.mute, onchange: (e) => set("mute", e.target.checked || undefined) }), " Start muted"))));
+  }
   // ISO
   const iso = f.iso;
-  parts.push(h("fieldset", {}, h("legend", {}, h("label", {}, h("input", { type: "checkbox", checked: !!iso, onchange: (e) => ctx.edit(() => {
+  if (hasVideo(f)) parts.push(h("fieldset", {}, h("legend", {}, h("label", {}, h("input", { type: "checkbox", checked: !!iso, onchange: (e) => ctx.edit(() => {
     if (e.target.checked) f.iso = { path: "recordings/{project}-{feed}-{date}-{time}" }; else delete f.iso;
   }) }), " Record this feed on its own (ISO, clean)")),
   iso ? h("div.grid3", {},
@@ -150,7 +212,7 @@ function editor(ctx, f) {
       ["mp4", "mkv", "mov"].map((c) => h("option", { selected: (iso.container || "mp4") === c }, c)))),
     field("Start", h("select", { onchange: (e) => ctx.edit(() => { if (e.target.value === "1") iso.manual = true; else delete iso.manual; }, false) },
       h("option", { value: "", selected: !iso.manual }, "with the show"), h("option", { value: "1", selected: !!iso.manual }, "by hand")))) : null));
-  parts.push(h("p.dim", {}, usedIn.length ? "Shown in: " + usedIn.join(", ") : "Not in any layout yet (Layouts tab)."));
+  if (hasVideo(f)) parts.push(h("p.dim", {}, usedIn.length ? "Shown in: " + usedIn.join(", ") : "Not in any layout yet (Layouts tab)."));
   return parts;
 }
 

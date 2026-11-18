@@ -3,7 +3,10 @@
 //	GET  /api/status                         the show's state (JSON)
 //	POST /api/layout                         {"layout": "pip", "transition": {"kind": "mix", "duration_s": 1}}
 //	POST /api/feeds/{id}/{command}           play, pause, restart, seek ({"seconds": 12.5}), next, previous
-//	POST /api/recordings/{label}/{command}   start, stop, pause, resume ("program-1" …, "iso-<feed>")
+//	POST /api/feeds/{id}/audio               {"volume_db": -6, "mute": false, "mode": "follow|on|off"} (any of them)
+//	POST /api/recordings/{label}/{command}   start, stop, pause, resume ("program-1" …, "iso-<feed>", "stream-1" …)
+//	POST /api/monitor/{window|listen}        {"on": true}: the program in a window / its sound on the speakers
+//	GET  /api/levels                         the meters: {"program": {"peak_db", "rms_db"}, "<feed>": …}
 //	GET  /api/preview/{key}                  the latest JPEG of "program" or a feed
 //	GET  /api/preview/{key}/stream           the same as an MJPEG stream (browsers, VLC)
 //	GET  /api/ws                             WebSocket: {"type": "status", "status": …} at once and
@@ -82,6 +85,9 @@ func NewServer(cfg Config) *Server {
 	s.mux.HandleFunc("GET /api/status", s.withShow(func(sh *engine.Show, w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, sh.Status()) }))
 	s.mux.HandleFunc("POST /api/layout", s.withShow(s.layout))
 	s.mux.HandleFunc("POST /api/feeds/{id}/{cmd}", s.withShow(s.feed))
+	s.mux.HandleFunc("POST /api/feeds/{id}/audio", s.withShow(s.audio))
+	s.mux.HandleFunc("POST /api/monitor/{kind}", s.withShow(s.monitor))
+	s.mux.HandleFunc("GET /api/levels", s.withShow(func(sh *engine.Show, w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, sh.Levels()) }))
 	s.mux.HandleFunc("POST /api/recordings/{label}/{cmd}", s.withShow(s.recording))
 	s.mux.HandleFunc("GET /api/preview/{key}", s.withShow(s.preview))
 	s.mux.HandleFunc("GET /api/preview/{key}/stream", s.withShow(s.stream))
@@ -215,6 +221,38 @@ func (s *Server) feed(show *engine.Show, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := show.FeedCommand(r.PathValue("id"), r.PathValue("cmd"), req.Seconds); err != nil {
+		commandErr(w, err)
+		return
+	}
+	writeJSON(w, 200, show.Status())
+}
+
+func (s *Server) audio(show *engine.Show, w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		VolumeDB *float64 `json:"volume_db"`
+		Mute     *bool    `json:"mute"`
+		Mode     string   `json:"mode"`
+	}
+	if err := readBody(r, &req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := show.AudioCommand(r.PathValue("id"), req.VolumeDB, req.Mute, req.Mode); err != nil {
+		commandErr(w, err)
+		return
+	}
+	writeJSON(w, 200, show.Status())
+}
+
+func (s *Server) monitor(show *engine.Show, w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		On bool `json:"on"`
+	}
+	if err := readBody(r, &req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := show.Monitor(r.PathValue("kind"), req.On); err != nil {
 		commandErr(w, err)
 		return
 	}

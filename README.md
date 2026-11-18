@@ -6,10 +6,10 @@ picture-in-picture, side by side, grids, your own), switches between layouts liv
 transitions, and records and streams the result. It runs on a desktop, a server or a small box,
 from its desktop window, a web browser, or remotely through its control API.
 
-> **Status:** milestone 3 (the GUI) done, waiting for review: shows are built, run and switched
-> from a desktop window or a web browser. See [docs/PLAN.md](docs/PLAN.md),
-> [docs/milestone-3.md](docs/milestone-3.md) (with a short guide to the GUI) and
-> [docs/api.md](docs/api.md).
+> **Status:** milestone 4 (sources, sound and streaming) done, waiting for review: cameras, network
+> streams and sound inputs; a sound mixer with meters; streaming to RTMP services and over SRT;
+> hardware encoders. See [docs/PLAN.md](docs/PLAN.md), [docs/milestone-4.md](docs/milestone-4.md),
+> [docs/milestone-3.md](docs/milestone-3.md) (the GUI) and [docs/api.md](docs/api.md).
 
 ## Try it
 
@@ -17,7 +17,10 @@ Linux with GStreamer 1.20 or newer (developed on 1.28) and its development packa
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+  gstreamer1.0-pulseaudio
+# hardware encoding on Intel graphics (optional; found and tested by itself):
+sudo apt install intel-media-va-driver-non-free
 go build -o bgamix ./cmd/bgamix
 ```
 
@@ -40,7 +43,8 @@ go test ./...                                     # decodes its own recordings a
 ```
 
 A show is a `.bgamix` file (JSON): the output picture, the feeds (test patterns, video files, still
-images), layouts that place them (boxes as fractions of the picture) and recordings. See
+images, playlists, cameras, network streams, sound inputs), layouts that place them (boxes as
+fractions of the picture), recordings and streams. See
 `examples/` and [docs/milestone-1.md](docs/milestone-1.md).
 
 ## How it works

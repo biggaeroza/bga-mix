@@ -156,3 +156,42 @@ func TestGuard(t *testing.T) {
 func exec(png string) error {
 	return runGst("videotestsrc num-buffers=1 pattern=red ! video/x-raw,width=64,height=36 ! pngenc ! filesink location=" + png)
 }
+
+func TestDevicesAndAudioAPI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs GStreamer")
+	}
+	srv, st := studioServer(t)
+	code, v := call(t, srv, "GET", "/api/devices", "")
+	if code != 200 || v["cameras"] == nil || v["audio_inputs"] == nil {
+		t.Errorf("devices %d %v", code, v)
+	}
+	t.Logf("devices %v", v)
+	p := app.NewProject()
+	p.Output = project.Output{Width: 320, Height: 180, FPS: 25}
+	p.Feeds = append(p.Feeds, project.Feed{ID: "tone", Type: "audio", Pattern: "tone"})
+	if err := st.Start(p, ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(800 * time.Millisecond)
+	if code, v := call(t, srv, "POST", "/api/feeds/tone/audio", `{"volume_db": -6, "mode": "on"}`); code != 200 {
+		t.Errorf("audio %d %v", code, v)
+	}
+	if code, _ := call(t, srv, "POST", "/api/feeds/bars/audio", `{"mute": true}`); code != 400 {
+		t.Errorf("a feed without sound: %d", code)
+	}
+	if code, _ := call(t, srv, "POST", "/api/feeds/tone/audio", `{"volume_db": 40}`); code != 400 {
+		t.Errorf("+40 dB: %d", code)
+	}
+	time.Sleep(400 * time.Millisecond)
+	code, v = call(t, srv, "GET", "/api/levels", "")
+	if code != 200 || v["program"] == nil || v["tone"] == nil {
+		t.Errorf("levels %d %v", code, v)
+	}
+	if code, _ := call(t, srv, "POST", "/api/monitor/radio", `{"on": true}`); code != 400 {
+		t.Errorf("unknown monitor %d", code)
+	}
+	if code, v := call(t, srv, "GET", "/api/meta", ""); code != 200 || len(v["encoders"].([]any)) != 5 {
+		t.Errorf("meta %v", v)
+	}
+}

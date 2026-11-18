@@ -51,7 +51,8 @@ func makeClip(t *testing.T, path string, frames int, patterns ...string) {
 	for _, p := range patterns {
 		desc += fmt.Sprintf(" videotestsrc pattern=%s num-buffers=%d ! video/x-raw,width=320,height=180,framerate=25/1 ! c.", p, frames)
 	}
-	desc += fmt.Sprintf(" audiotestsrc num-buffers=%d ! audioconvert ! opusenc ! m.", len(patterns)*frames*2)
+	// sound exactly as long as the picture: 1920 samples at 48 kHz per 25 fps frame
+	desc += fmt.Sprintf(" audiotestsrc num-buffers=%d samplesperbuffer=1920 ! audio/x-raw,rate=48000 ! audioconvert ! opusenc ! m.", len(patterns)*frames)
 	gstRun(t, desc)
 }
 

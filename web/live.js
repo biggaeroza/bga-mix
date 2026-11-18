@@ -8,10 +8,12 @@ import { mini } from "./layouts.js";
 let built = null; // {el, parts…} while the tab shows a running show
 let keyHandler = null;
 const loops = new Set();
+let meterTimer = null;
 
 export function unmount() {
   for (const l of loops) l.stop = true;
   loops.clear();
+  clearInterval(meterTimer);
   if (keyHandler) window.removeEventListener("keydown", keyHandler);
   keyHandler = null;
   built = null;
@@ -57,17 +59,31 @@ export function render(el, ctx) {
 
   const feedCards = s.feeds.map((f) => feedCard(ctx, f, fps));
   const recRows = h("div.recs", {});
+  const streamRows = h("div.recs", {});
+  const progMeter = meter("program");
+  const monitor = h("div.row.wrap", {});
   el.append(h("div.live", {},
     h("section.program", {},
       h("div.prog-frame", { style: { aspectRatio: `${s.output.width} / ${s.output.height}` } }, preview("program", fps, "prog"), h("span.onair-tag", {}, "PROGRAM")),
-      progInfo),
+      progInfo, h("div.prog-sound", {}, h("span.dim", {}, "Program sound"), progMeter.el)),
     h("aside.side", {},
       h("section.panel", {}, h("h3", {}, "Transition"), h("div.row.wrap", {}, mode, h("label.row", {}, "mix ", dur, " s"))),
-      h("section.panel", {}, h("h3", {}, "Recordings"), recRows)),
+      h("section.panel", {}, h("h3", {}, "Recordings"), recRows),
+      s.streams.length ? h("section.panel", {}, h("h3", {}, "Streams"), streamRows) : null,
+      h("section.panel", {}, h("h3", {}, "On this computer"), monitor)),
     h("section.layouts-row", {}, h("h3", {}, "Layouts"), h("div.takes", {}, layoutBtns)),
     h("section.feeds-row", {}, h("h3", {}, "Feeds"), h("div.feed-cards", {}, feedCards.map((c) => c.el)))));
 
-  built = { progInfo, layoutBtns, feedCards, recRows, recKey: "" };
+  built = { progInfo, layoutBtns, feedCards, recRows, recKey: "", streamRows, streamKey: "", monitor, monKey: "", meters: { program: progMeter } };
+  for (const c of feedCards) if (c.meter) built.meters[c.id] = c.meter;
+  // the meters: 8 readings a second
+  meterTimer = setInterval(async () => {
+    if (!built) return;
+    try {
+      const lv = await api("levels");
+      for (const [k, m] of Object.entries(built.meters)) m.set(lv[k]);
+    } catch { /* the show stopped */ }
+  }, 125);
   keyHandler = (e) => {
     if (st.tab !== "live" || e.ctrlKey || e.metaKey || e.altKey || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName)) return;
     const n = +e.key;
@@ -89,8 +105,25 @@ function idle(el, ctx) {
     h("p.dim", {}, "Starting runs every feed, the mixer with the start layout, the previews here and the recordings that start with the show. The show runs the project as it is when started; it does not need saving first.")));
 }
 
+// meter is a horizontal level meter: the RMS as a bar, the peak as a line; -60 to 0 dBFS, green
+// to -18, yellow to -6, red above.
+function meter(key) {
+  const bar = h("span.bar", {}), peak = h("span.peak", {}), txt = h("span.db", {});
+  const el = h("div.meter", { title: key === "program" ? "The program's level" : "Its level as it comes in (before its fader)" }, bar, peak, txt);
+  const pos = (db) => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  return { el, set(lv) {
+    if (!lv || lv.peak_db <= -99) { bar.style.width = "0"; peak.style.left = "0"; txt.textContent = "–∞"; el.classList.remove("hot", "warm"); return; }
+    bar.style.width = pos(lv.rms_db) + "%";
+    peak.style.left = pos(lv.peak_db) + "%";
+    txt.textContent = lv.peak_db.toFixed(0);
+    el.classList.toggle("hot", lv.peak_db > -6);
+    el.classList.toggle("warm", lv.peak_db > -18 && lv.peak_db <= -6);
+  } };
+}
+
 function feedCard(ctx, f, fps) {
   const isFile = f.type === "file" || f.type === "playlist";
+  const soundOnly = f.type === "audio";
   const state = h("span.state", {});
   const err = h("div.err", {});
   const pos = h("span.pos", {});
@@ -102,16 +135,41 @@ function feedCard(ctx, f, fps) {
     catch (e) { toast(e.message, "bad"); }
   };
   const btn = (c, label, title) => h("button.icon", { title, onclick: () => cmd(c) }, label);
+  // sound: meter, mute, fader, mode
+  let audioRow = null, m = null, muteBtn = null, fader = null, modeSel = null, faderBusy = false, faderTimer;
+  const audio = async (body) => {
+    try { await api(`feeds/${encodeURIComponent(f.id)}/audio`, body); } catch (e) { toast(e.message, "bad"); }
+  };
+  if (f.has_audio) {
+    m = meter(f.id);
+    muteBtn = h("button.icon.mute", { title: "Mute", onclick: () => audio({ mute: !muteBtn.classList.contains("on") }) }, "M");
+    fader = h("input.fader", { type: "range", min: -60, max: 12, step: 0.5, value: f.volume_db, "aria-label": "Level (dB)", title: "Level (dB)",
+      onpointerdown: () => { faderBusy = true; }, onpointerup: () => { faderBusy = false; },
+      oninput: (e) => { clearTimeout(faderTimer); faderTimer = setTimeout(() => audio({ volume_db: +e.target.value }), 60); },
+      ondblclick: () => audio({ volume_db: 0 }) });
+    modeSel = h("select.mode", { title: "Heard: following the picture, always, or not", onchange: (e) => audio({ mode: e.target.value }) },
+      [["follow", "AFV"], ["on", "On"], ["off", "Off"]].map(([v, n]) => h("option", { value: v, selected: f.audio === v }, n)));
+    audioRow = h("div.audio-row", {}, m.el, h("div.row", {}, muteBtn, fader, h("span.vol", {}), modeSel));
+  }
   const el = h("div.feed-card", { style: { "--c": colour(f.id) } },
-    h("div.feed-pic", {}, preview(f.id, fps, "feed"), h("span.feed-name", {}, f.name || f.id)),
+    soundOnly ? h("div.feed-pic.sound", {}, h("span.big", {}, "🔊\uFE0E"), h("span.feed-name", {}, f.name || f.id))
+      : h("div.feed-pic", {}, preview(f.id, fps, "feed"), h("span.feed-name", {}, f.name || f.id)),
     h("div.feed-bar", {}, state,
       isFile ? h("span.transport", {},
         f.type === "playlist" ? btn("previous", "⏮\uFE0E", "Previous item") : null,
         btn("play", "▶", "Play"), btn("pause", "⏸\uFE0E", "Pause"), btn("restart", "⟲", "From the start"),
         f.type === "playlist" ? btn("next", "⏭\uFE0E", "Next item") : null) : btn("restart", "⟲", "Restart the feed")),
     isFile ? h("div.seek-row", {}, seek, pos) : null,
+    audioRow,
     err);
-  return { id: f.id, el, update(fs) {
+  return { id: f.id, el, meter: m, update(fs) {
+    if (f.has_audio) {
+      muteBtn.classList.toggle("on", !!fs.mute);
+      if (!faderBusy && document.activeElement !== fader) fader.value = fs.volume_db;
+      audioRow.querySelector(".vol").textContent = `${fs.volume_db > 0 ? "+" : ""}${fs.volume_db.toFixed(1)}`;
+      if (modeSel.value !== fs.audio) modeSel.value = fs.audio;
+      el.classList.toggle("heard", fs.heard > 0.01);
+    }
     state.className = "state " + fs.state;
     state.textContent = fs.state + (fs.items ? ` ${fs.item}/${fs.items}` : "") + (fs.restarts ? ` · ${fs.restarts} restart(s)` : "");
     err.textContent = fs.error || "";
@@ -141,10 +199,43 @@ export function update(ctx) {
     built.recKey = key;
     put(built.recRows, ...(s.recordings.length ? s.recordings.map((r) => recRow(r)) : [h("p.dim", {}, "None in this show.")]));
   }
+  const sk = s.streams.map((x) => x.label + x.state + (x.error || "")).join();
+  if (sk !== built.streamKey) {
+    built.streamKey = sk;
+    put(built.streamRows, s.streams.map((x) => streamRow(x)));
+  }
+  for (const x of s.streams) {
+    const row = built.streamRows.querySelector(`[data-label="${x.label}"] .figs`);
+    if (row) row.textContent = x.state === "live" ? `${duration(x.elapsed_s)} · ${x.encoder} encoder` : "";
+  }
+  const mk = `${s.window}${s.listen}`;
+  if (mk !== built.monKey) {
+    built.monKey = mk;
+    const toggle = (kind, on, label, title) => h("button", { class: on ? "on" : "", title, onclick: async () => {
+      try { await api(`monitor/${kind}`, { on: !on }); } catch (e) { toast(e.message, "bad"); }
+    } }, (on ? "■ " : "") + label);
+    put(built.monitor,
+      toggle("window", s.window, s.window ? "Close the program window" : "Program window", "The program in a window of its own (for a second screen or a projector)"),
+      toggle("listen", s.listen, s.listen ? "Stop listening" : "Listen", "The program's sound on this computer's speakers"));
+  }
   for (const r of s.recordings) {
     const row = built.recRows.querySelector(`[data-label="${r.label}"] .figs`);
     if (row) row.textContent = r.state === "recording" || r.state === "paused" ? `${duration(r.elapsed_s)} · ${bytes(r.bytes)}` : r.files?.length ? `${r.files.length} file(s)` : "";
   }
+}
+
+function streamRow(x) {
+  const cmd = async (c) => {
+    if (c === "stop" && !confirm(`Stop the stream ${x.name || x.label}? Viewers lose the picture.`)) return;
+    try { await api(`recordings/${encodeURIComponent(x.label)}/${c}`, {}); } catch (e) { toast(e.message, "bad"); }
+  };
+  const on = x.state === "live" || x.state === "reconnecting";
+  return h("div.rec-row", { "data-label": x.label },
+    h("span.recdot", { class: x.state === "live" ? "on" : x.state === "reconnecting" ? "paused" : "" }),
+    h("div.grow", {}, h("div", {}, x.name || x.label, " ", h("span.state", { class: x.state === "live" ? "recording" : x.state === "reconnecting" ? "restarting" : x.state }, x.state)),
+      h("div.dim.path", { title: x.url }, x.url), h("div.figs.dim", {}), x.error ? h("div.err", {}, x.error) : null),
+    h("div.row", {},
+      on ? h("button", { onclick: () => cmd("stop") }, "■ Stop") : h("button.rec", { onclick: () => cmd("start") }, "Go live")));
 }
 
 function recRow(r) {

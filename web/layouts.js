@@ -3,13 +3,13 @@
 // arrow keys nudge the chosen box (Shift: ten times more), Delete removes it.
 
 import { h, url, colour, uniqueID, toast, put } from "./api.js";
-import { thumb } from "./feeds.js";
+import { thumb, hasVideo } from "./feeds.js";
 
 const SNAP = 0.012;         // fraction of the picture within which edges snap
 const MIN = 0.02;           // the smallest box
 
 const TEMPLATES = {
-  full: { name: "Full screen", boxes: (f) => f.slice(0, 1).map((id) => box(id, 0, 0, 1, 1)) },
+  full: { name: "Full screen", boxes: (f) => f.slice(0, 1).map((id) => box(id, 0, 0, 1, 1)) },  // f: the feeds with a picture
   pip: { name: "Picture in picture", boxes: (f) => [box(f[0], 0, 0, 1, 1), box(f[1] ?? f[0], 0.66, 0.04, 0.3, 0.3)].filter((b) => b.feed) },
   side: { name: "Side by side", boxes: (f) => [box(f[0], 0, 0.25, 0.5, 0.5), box(f[1] ?? f[0], 0.5, 0.25, 0.5, 0.5)].filter((b) => b.feed) },
   grid: { name: "Grid 2×2", boxes: (f) => f.slice(0, 4).map((id, i) => box(id, (i % 2) * 0.5, Math.floor(i / 2) * 0.5, 0.5, 0.5)) },
@@ -35,7 +35,7 @@ export function render(el, ctx) {
   const addLayout = (t) => {
     const tpl = TEMPLATES[t];
     const id = uniqueID(t, p.layouts.map((x) => x.id));
-    ctx.edit((p) => p.layouts.push({ id, name: tpl.name, boxes: tpl.boxes(p.feeds.map((f) => f.id)) }));
+    ctx.edit((p) => p.layouts.push({ id, name: tpl.name, boxes: tpl.boxes(p.feeds.filter(hasVideo).map((f) => f.id)) }));
     st.sel.layout = id; st.sel.box = 0; ctx.draw();
   };
   el.append(h("div.split", {},
@@ -197,7 +197,7 @@ function editor(ctx, l, startID) {
     h("tbody", {}, l.boxes.map((b, i) => h("tr", { "data-i": i, class: i === st.sel.box ? "sel" : "", onclick: () => select(i) },
       h("td", {}, h("span.swatch", { style: { background: colour(b.feed) } }), i + 1),
       h("td", {}, h("select", { onchange: (e) => ctx.edit(() => { b.feed = e.target.value; }) },
-        p.feeds.map((f) => h("option", { value: f.id, selected: f.id === b.feed }, f.name || f.id)),
+        p.feeds.filter(hasVideo).map((f) => h("option", { value: f.id, selected: f.id === b.feed }, f.name || f.id)),
         p.feeds.some((f) => f.id === b.feed) ? null : h("option", { selected: true, value: b.feed }, b.feed + " (missing)"))),
       ["x", "y", "w", "h"].map((k) => h("td", {}, h("input.num", { type: "number", step: 0.5, min: 0, max: 100, "data-k": k, value: pct(b[k]),
         onchange: (e) => {
@@ -225,7 +225,8 @@ function editor(ctx, l, startID) {
     ctx.edit((p) => { if (p.start_layout === l.id) p.start_layout = to; l.id = to; });
     st.sel.layout = to; ctx.draw();
   } });
-  const unused = p.feeds.filter((f) => !l.boxes.some((b) => b.feed === f.id));
+  const pictured = p.feeds.filter(hasVideo);
+  const unused = pictured.filter((f) => !l.boxes.some((b) => b.feed === f.id));
   const running = st.studio.running;
   return [
     h("div.editor-head", {},
@@ -248,7 +249,7 @@ function editor(ctx, l, startID) {
         ctx.edit(() => l.boxes.push(box(e.target.value, 0.1 + (n % 5) * 0.05, 0.1 + (n % 5) * 0.05, 0.4, 0.4)));
         st.sel.box = n; ctx.draw();
       } }, h("option", { value: "" }, "+ Add a box for…"), unused.map((f) => h("option", { value: f.id }, f.name || f.id)),
-        unused.length < p.feeds.length ? h("optgroup", { label: "again" }, p.feeds.filter((f) => !unused.includes(f)).map((f) => h("option", { value: f.id }, f.name || f.id))) : null),
+        unused.length < pictured.length ? h("optgroup", { label: "again" }, pictured.filter((f) => !unused.includes(f)).map((f) => h("option", { value: f.id }, f.name || f.id))) : null),
       h("label", {}, keep, " keep the box's shape (Shift: free)"),
       h("span.dim", {}, "Drag to move, corners to resize; Alt: no snapping; arrows nudge; Delete removes.")),
     table,

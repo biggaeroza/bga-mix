@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,6 +34,24 @@ type Project struct {
 	// Transition is the default when switching layouts (a switch may override it).
 	Transition *Transition `json:"transition,omitempty"`
 	Recordings []Recording `json:"recordings,omitempty"`
+	// Streams send the program (picture and sound) to a server.
+	Streams []Stream `json:"streams,omitempty"`
+}
+
+// Stream sends the program to a streaming server or another machine.
+type Stream struct {
+	Name string `json:"name,omitempty"`
+	// URL: rtmp:// or rtmps:// (YouTube, Twitch, Facebook …; FLV with H.264 and AAC), or
+	// srt://host:port (MPEG-TS; ?mode=listener to wait for the receiver).
+	URL string `json:"url"`
+	// Key is the stream key, added to an RTMP URL (kept out of the status and logs).
+	Key       string `json:"key,omitempty"`
+	VideoKbps int    `json:"video_kbps,omitempty"` // default by resolution, as recordings
+	AudioKbps int    `json:"audio_kbps,omitempty"` // default 160
+	Codec     string `json:"codec,omitempty"`      // h264 (default); h265 over SRT only
+	Encoder   string `json:"encoder,omitempty"`
+	Manual    bool   `json:"manual,omitempty"`     // waits to be started
+	LatencyMS int    `json:"latency_ms,omitempty"` // SRT (default 200 ms)
 }
 
 // Transitions between layouts.
@@ -63,7 +82,32 @@ const (
 	FeedFile     = "file"     // a video file
 	FeedImage    = "image"    // a still image
 	FeedPlaylist = "playlist" // video files played in turn
+	FeedCamera   = "camera"   // a camera or capture card (Video4Linux)
+	FeedStream   = "stream"   // a network stream: rtsp://, srt://, udp://, rtmp://, http(s)://
+	FeedAudio    = "audio"    // sound only: a microphone or line input, or a test tone
 )
+
+// Audio modes of a feed.
+const (
+	AudioFollow = "follow" // heard while the feed is in the layout on air (default)
+	AudioOn     = "on"     // always heard
+	AudioOff    = "off"    // never heard
+)
+
+// HasVideo reports whether a feed type has a picture (and so can be in layouts).
+func HasVideo(t string) bool { return t != FeedAudio }
+
+// HasAudio reports whether a feed type may carry sound into the mix.
+func HasAudio(t string) bool {
+	return t == FeedFile || t == FeedPlaylist || t == FeedStream || t == FeedAudio
+}
+
+// Stream URL schemes a stream feed takes.
+var StreamSchemes = []string{"rtsp", "rtsps", "srt", "udp", "rtmp", "rtmps", "http", "https"}
+
+// Encoders that recordings and streams may ask for ("" or auto: the first that works of the
+// hardware encoders, else x264/x265).
+var Encoders = []string{"auto", "software", "va", "vaapi", "nvenc", "qsv"}
 
 // End behaviours of a file feed when it reaches its end (or its out point).
 const (
@@ -79,9 +123,25 @@ const (
 type Feed struct {
 	ID   string `json:"id"`   // letters, digits, - and _; referenced by layouts
 	Name string `json:"name"` // shown in the UI
-	Type string `json:"type"` // test, file, image
-	// test
-	Pattern string `json:"pattern,omitempty"` // a GStreamer videotestsrc pattern; default "smpte"
+	Type string `json:"type"` // test, file, image, playlist, camera, stream, audio
+	// test: a GStreamer videotestsrc pattern (default "smpte"); audio: "tone" for a 440 Hz test
+	// tone instead of a device
+	Pattern string `json:"pattern,omitempty"`
+	// camera: the device (default /dev/video0); audio: the input device (PulseAudio/PipeWire
+	// source name; default the system's input)
+	Device string `json:"device,omitempty"`
+	// camera: the picture asked of the device (0: its default)
+	Width  int `json:"width,omitempty"`
+	Height int `json:"height,omitempty"`
+	FPS    int `json:"fps,omitempty"`
+	// stream: the URL; LatencyMS is the buffer for rtsp and srt (default 200 ms)
+	URL       string `json:"url,omitempty"`
+	LatencyMS int    `json:"latency_ms,omitempty"`
+	// Audio: follow (default), on or off; VolumeDB its level (0 dB: as it is; -60 to +12);
+	// Mute starts it muted.
+	Audio    string  `json:"audio,omitempty"`
+	VolumeDB float64 `json:"volume_db,omitempty"`
+	Mute     bool    `json:"mute,omitempty"`
 	// file, image: relative to the project file
 	Path string `json:"path,omitempty"`
 	// file
@@ -126,6 +186,11 @@ type Recording struct {
 	BitrateKbps int `json:"bitrate_kbps,omitempty"`
 	// Manual: the recording waits to be started (otherwise it starts with the show).
 	Manual bool `json:"manual,omitempty"`
+	// Encoder: auto (default), software, va, vaapi, nvenc or qsv.
+	Encoder string `json:"encoder,omitempty"`
+	// NoAudio leaves the sound out; AudioKbps is the AAC bitrate (default 160).
+	NoAudio   bool `json:"no_audio,omitempty"`
+	AudioKbps int  `json:"audio_kbps,omitempty"`
 	// Segments: a new file every SegmentS seconds or SegmentMB megabytes (0: no limit), named
 	// with -001, -002 … before the extension.
 	SegmentS  float64 `json:"segment_s,omitempty"`
@@ -210,8 +275,29 @@ func (p *Project) Validate(dir string) error {
 					add(at+".end", "loop, hold, black or return")
 				}
 			}
+		case FeedCamera:
+			if f.Width < 0 || f.Height < 0 || f.FPS < 0 || f.Width > 7680 || f.Height > 4320 || f.FPS > 240 {
+				add(at, "width, height and fps: 0 (the camera's default) or a size and rate the camera offers")
+			}
+		case FeedStream:
+			if err := checkURL(f.URL, StreamSchemes); err != "" {
+				add(at+".url", "%s", err)
+			}
+			if f.LatencyMS < 0 || f.LatencyMS > 10000 {
+				add(at+".latency_ms", "0 to 10000")
+			}
+		case FeedAudio:
+			if f.Pattern != "" && f.Pattern != "tone" {
+				add(at+".pattern", `"tone" or nothing (a device)`)
+			}
 		default:
-			add(at+".type", "test, file, image or playlist")
+			add(at+".type", "test, file, image, playlist, camera, stream or audio")
+		}
+		if f.Audio != "" && f.Audio != AudioFollow && f.Audio != AudioOn && f.Audio != AudioOff {
+			add(at+".audio", "follow, on or off")
+		}
+		if f.VolumeDB < -60 || f.VolumeDB > 12 {
+			add(at+".volume_db", "-60 to +12 dB")
 		}
 		if f.ISO != nil {
 			validateRecording(f.ISO, at+".iso", add)
@@ -234,6 +320,8 @@ func (p *Project) Validate(dir string) error {
 			bt := fmt.Sprintf("%s.boxes[%d]", at, j)
 			if !feeds[b.Feed] {
 				add(bt+".feed", "no feed %q", b.Feed)
+			} else if f := p.Feed(b.Feed); f != nil && !HasVideo(f.Type) {
+				add(bt+".feed", "%q is sound only: it has no picture to place", b.Feed)
 			} else if seen[b.Feed] {
 				add(bt+".feed", "feed %q is already in this layout (a feed appears once per layout)", b.Feed)
 			}
@@ -266,6 +354,29 @@ func (p *Project) Validate(dir string) error {
 	for i := range p.Recordings {
 		validateRecording(&p.Recordings[i], fmt.Sprintf("recordings[%d]", i), add)
 	}
+	for i, st := range p.Streams {
+		at := fmt.Sprintf("streams[%d]", i)
+		if err := checkURL(st.URL, []string{"rtmp", "rtmps", "srt"}); err != "" {
+			add(at+".url", "%s", err)
+		}
+		if st.VideoKbps < 0 || st.VideoKbps > 200000 {
+			add(at+".video_kbps", "0 (automatic) to 200000")
+		}
+		if st.AudioKbps < 0 || st.AudioKbps > 512 {
+			add(at+".audio_kbps", "0 (160) to 512")
+		}
+		if st.Codec != "" && st.Codec != "h264" && st.Codec != "h265" {
+			add(at+".codec", "h264 or h265")
+		} else if st.Codec == "h265" && strings.HasPrefix(st.URL, "rtmp") {
+			add(at+".codec", "RTMP carries H.264 only")
+		}
+		if st.Encoder != "" && !contains(Encoders, st.Encoder) {
+			add(at+".encoder", "one of %s", strings.Join(Encoders, ", "))
+		}
+		if st.LatencyMS < 0 || st.LatencyMS > 10000 {
+			add(at+".latency_ms", "0 to 10000")
+		}
+	}
 	if len(ps) > 0 {
 		return ps
 	}
@@ -295,6 +406,12 @@ func validateRecording(r *Recording, at string, add func(string, string, ...any)
 	if r.SegmentMB < 0 || (r.SegmentMB > 0 && r.SegmentMB < 1) {
 		add(at+".segment_mb", "0 (no limit) or at least 1 MB")
 	}
+	if r.Encoder != "" && !contains(Encoders, r.Encoder) {
+		add(at+".encoder", "one of %s", strings.Join(Encoders, ", "))
+	}
+	if r.AudioKbps < 0 || r.AudioKbps > 512 {
+		add(at+".audio_kbps", "0 (160) to 512")
+	}
 }
 
 // Layout returns a layout by id (nil when there is none).
@@ -315,6 +432,38 @@ func (p *Project) Feed(id string) *Feed {
 		}
 	}
 	return nil
+}
+
+// checkURL checks a URL's form and scheme ("" when good).
+func checkURL(raw string, schemes []string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "give the URL"
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err.Error()
+	}
+	if !contains(schemes, strings.ToLower(u.Scheme)) {
+		return "the URL must start with " + strings.Join(schemes, "://, ") + "://"
+	}
+	if u.Host == "" {
+		return "the URL has no host or port (" + u.Scheme + "://host:port…)"
+	}
+	return ""
+}
+
+// AudioMode is a feed's audio mode with its default.
+func (f *Feed) AudioMode() string {
+	if !HasAudio(f.Type) {
+		return AudioOff
+	}
+	if f.Audio == "" {
+		if f.Type == FeedAudio {
+			return AudioOn
+		}
+		return AudioFollow
+	}
+	return f.Audio
 }
 
 func contains(l []string, s string) bool {

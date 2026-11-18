@@ -59,9 +59,27 @@ func quote(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
-// FeedChannel and ProgramChannel name a run's intervideo channels.
-func FeedChannel(runID, feedID string) string { return "bgamix-" + runID + "-f-" + feedID }
-func ProgramChannel(runID string) string      { return "bgamix-" + runID + "-program" }
+// FeedChannel and ProgramChannel name a run's intervideo channels, AudioChannel and
+// ProgramAudioChannel its interaudio channels.
+func FeedChannel(runID, feedID string) string  { return "bgamix-" + runID + "-f-" + feedID }
+func ProgramChannel(runID string) string       { return "bgamix-" + runID + "-program" }
+func AudioChannel(runID, feedID string) string { return "bgamix-" + runID + "-a-" + feedID }
+func ProgramAudioChannel(runID string) string  { return "bgamix-" + runID + "-program-audio" }
+
+// Sound is mixed as 48 kHz stereo 32-bit float, the format every audio branch is brought to.
+const audioCaps = "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2"
+
+// levelInterval is how often the meters are measured (ns).
+const levelInterval = 100_000_000
+
+// DefaultAudioKbps is the AAC bitrate of recordings and streams.
+const DefaultAudioKbps = 160
+
+// streamGOP is a stream's key frame interval in seconds (services ask for 2 to 4 s).
+const streamGOP = 2
+
+// DefaultLatencyMS is the receive buffer of rtsp and srt sources and srt outputs.
+const DefaultLatencyMS = 200
 
 // Held reports whether a feed's channel keeps its last frame when the feed stops sending (files,
 // playlists and images: paused, ended or between playlist items); a test pattern that stops
@@ -72,17 +90,21 @@ func Held(f project.Feed) bool {
 
 // FeedPipeline describes a feed's pipeline: its source (for a playlist, its item'th file),
 // normalised to the output (scaled to fit with borders, the output's frame rate and format),
-// into its intervideo channel.
-func FeedPipeline(f project.Feed, item int, o project.Output, dir, channel string) string {
+// into its intervideo channel; with achannel, its sound (48 kHz stereo) into that interaudio
+// channel. The audio sink does not wait for sound (async=false): a file may have none.
+func FeedPipeline(f project.Feed, item int, o project.Output, dir, channel, achannel string) string {
 	norm := "videoconvert ! videoscale add-borders=true ! videorate ! " + caps(o)
 	sink := "intervideosink channel=" + quote(channel)
+	audio := ""
+	if achannel != "" {
+		audio = " dec. ! audio/x-raw ! queue ! audioconvert ! audioresample ! " + audioCaps + " ! interaudiosink async=false channel=" + quote(achannel)
+	}
 	file := func(path string) string {
 		// show-preroll-frame=false: the frame decoded while the file is paused before its seek
 		// to the in point would otherwise reach the mix (a flash of the file's start)
 		// (it is turned on again after that seek, so that seeking a paused file shows the frame)
 		sink := "intervideosink name=out show-preroll-frame=false channel=" + quote(channel)
-		// decodebin's audio pad stays unlinked until audio is mixed (milestone 4)
-		return fmt.Sprintf("filesrc location=%s ! decodebin name=dec dec. ! video/x-raw ! queue ! %s ! %s", quote(project.Resolve(dir, path)), norm, sink)
+		return fmt.Sprintf("filesrc location=%s ! decodebin name=dec dec. ! video/x-raw ! queue ! %s ! %s%s", quote(project.Resolve(dir, path)), norm, sink, audio)
 	}
 	switch f.Type {
 	case project.FeedTest:
@@ -98,8 +120,54 @@ func FeedPipeline(f project.Feed, item int, o project.Output, dir, channel strin
 	case project.FeedImage:
 		return fmt.Sprintf("filesrc location=%s ! decodebin ! imagefreeze is-live=true ! %s ! %s",
 			quote(project.Resolve(dir, f.Path)), norm, sink)
+	case project.FeedCamera:
+		dev := f.Device
+		if dev == "" {
+			dev = "/dev/video0"
+		}
+		want := ""
+		if f.Width > 0 && f.Height > 0 {
+			c := fmt.Sprintf(",width=%d,height=%d", f.Width, f.Height)
+			if f.FPS > 0 {
+				c += fmt.Sprintf(",framerate=%d/1", f.FPS)
+			}
+			// raw or MJPEG, whichever the camera gives at that size
+			want = fmt.Sprintf(` ! capsfilter caps="video/x-raw%s;image/jpeg%s"`, c, c)
+		}
+		return fmt.Sprintf("v4l2src device=%s%s ! decodebin ! queue ! %s ! %s", quote(dev), want, norm, sink)
+	case project.FeedStream:
+		return fmt.Sprintf("uridecodebin name=dec uri=%s dec. ! video/x-raw ! queue ! %s ! %s%s", quote(StreamURI(f)), norm, sink, audio)
+	case project.FeedAudio:
+		src := "pulsesrc"
+		if f.Pattern == "tone" {
+			src = "audiotestsrc is-live=true wave=sine freq=440 volume=0.25"
+		} else if f.Device != "" {
+			src += " device=" + quote(f.Device)
+		}
+		return fmt.Sprintf("%s ! queue ! audioconvert ! audioresample ! %s ! interaudiosink channel=%s", src, audioCaps, quote(achannel))
 	}
 	return ""
+}
+
+// StreamURI is a stream feed's URI; an SRT URL gets its latency as a parameter (srtsrc reads it
+// there; an RTSP source gets it when uridecodebin makes it).
+func StreamURI(f project.Feed) string {
+	u := f.URL
+	if strings.HasPrefix(strings.ToLower(u), "srt://") && !strings.Contains(u, "latency=") {
+		sep := "?"
+		if strings.Contains(u, "?") {
+			sep = "&"
+		}
+		u += fmt.Sprintf("%slatency=%d", sep, latency(f.LatencyMS))
+	}
+	return u
+}
+
+func latency(ms int) int {
+	if ms <= 0 {
+		return DefaultLatencyMS
+	}
+	return ms
 }
 
 // PadProps are a compositor pad's placement.
@@ -114,7 +182,9 @@ func Place(p *project.Project, l *project.Layout) map[string]PadProps {
 	o := p.Output
 	out := map[string]PadProps{}
 	for _, f := range p.Feeds {
-		out[f.ID] = PadProps{W: o.Width, H: o.Height, Alpha: 0}
+		if project.HasVideo(f.Type) {
+			out[f.ID] = PadProps{W: o.Width, H: o.Height, Alpha: 0}
+		}
 	}
 	if l == nil {
 		return out
@@ -142,22 +212,51 @@ func Lerp(a, b PadProps, t float64) PadProps {
 	return PadProps{X: l(a.X, b.X), Y: l(a.Y, b.Y), W: max(2, l(a.W, b.W)), H: max(2, l(a.H, b.H)), Z: b.Z, Alpha: a.Alpha + t*(b.Alpha-a.Alpha)}
 }
 
-// MixerPipeline describes the mixer: an intervideosrc per feed (in project order) into the
-// compositor, placed by the layout, into the program channel. The compositor takes its start
-// time from its first input (otherwise its first frames carry no timestamps).
+// VideoFeeds are the feeds with a picture, in project order: the mixer's inputs sink_0, sink_1 …
+func VideoFeeds(p *project.Project) []project.Feed {
+	var out []project.Feed
+	for _, f := range p.Feeds {
+		if project.HasVideo(f.Type) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// MixerPipeline describes the mixer: an intervideosrc per feed with a picture (in project
+// order) into the compositor, placed by the layout, into the program channel. The compositor
+// takes its start time from its first input (otherwise its first frames carry no timestamps).
 func MixerPipeline(p *project.Project, l *project.Layout, runID string) string {
 	o := p.Output
 	place := Place(p, l)
+	vf := VideoFeeds(p)
 	var b strings.Builder
 	b.WriteString("compositor name=mix start-time-selection=first background=black")
-	for i, f := range p.Feeds {
+	for i, f := range vf {
 		pp := place[f.ID]
 		fmt.Fprintf(&b, " sink_%d::xpos=%d sink_%d::ypos=%d sink_%d::width=%d sink_%d::height=%d sink_%d::zorder=%d sink_%d::alpha=%g",
 			i, pp.X, i, pp.Y, i, pp.W, i, pp.H, i, pp.Z, i, pp.Alpha)
 	}
 	fmt.Fprintf(&b, " ! %s ! intervideosink channel=%s", caps(o), quote(ProgramChannel(runID)))
-	for i, f := range p.Feeds {
+	for i, f := range vf {
 		fmt.Fprintf(&b, " %s ! queue ! mix.sink_%d", channelSource(FeedChannel(runID, f.ID), Held(f), o), i)
+	}
+	return b.String()
+}
+
+// AudioMixerPipeline describes the sound mixer: each feed's channel through a meter (before its
+// fader: it shows what comes in, even while faded out) and its fader (volume, starting silent)
+// into the mixer, with a silent input so that the mix runs with no sound at all; the program's
+// meter; into the program's audio channel. Elements are named lv-<feed>, vol-<feed> and
+// lv-program.
+func AudioMixerPipeline(feeds []string, runID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "audiomixer name=amix start-time-selection=first ! %s ! level name=lv-program interval=%d ! interaudiosink channel=%s",
+		audioCaps, levelInterval, quote(ProgramAudioChannel(runID)))
+	fmt.Fprintf(&b, " audiotestsrc is-live=true wave=silence ! %s ! amix.", audioCaps)
+	for _, id := range feeds {
+		fmt.Fprintf(&b, " interaudiosrc channel=%s ! %s ! level name=lv-%s interval=%d ! volume name=vol-%s volume=0 ! queue ! amix.",
+			quote(AudioChannel(runID, id)), audioCaps, id, levelInterval, id)
 	}
 	return b.String()
 }
@@ -247,17 +346,14 @@ func Bitrate(r project.Recording, o project.Output) int {
 }
 
 // RecordingPipeline describes a recording of a channel (the program, or a feed for an ISO
-// recording): encoded and muxed into path. MP4 and MOV are fragmented (a fragment and a key
-// frame every second) and streamable (the header first), and every buffer is written at once
-// (filesink's default 64 kB of in-process buffering emptied a killed low-bitrate recording), so a
-// recording cut short by a crash still plays up to its last fragment. With segments, splitmuxsink
-// starts a new file at the first key frame after each limit.
-func RecordingPipeline(r project.Recording, o project.Output, channel string, held bool, path string) string {
-	k := Bitrate(r, o)
-	enc := fmt.Sprintf("x264enc bitrate=%d speed-preset=veryfast tune=zerolatency key-int-max=%d ! h264parse", k, o.FPS)
-	if r.Codec == "h265" {
-		enc = fmt.Sprintf("x265enc bitrate=%d speed-preset=veryfast tune=zerolatency key-int-max=%d ! h265parse", k, o.FPS)
-	}
+// recording), with achannel's sound ("": none) in AAC: encoded (by the encoder kind) and muxed
+// into path. MP4 and MOV are fragmented (a fragment and a key frame every second) and
+// streamable (the header first), and every buffer is written at once (filesink's default 64 kB
+// of in-process buffering emptied a killed low-bitrate recording), so a recording cut short by a
+// crash still plays up to its last fragment. With segments, splitmuxsink starts a new file at
+// the first key frame after each limit.
+func RecordingPipeline(r project.Recording, o project.Output, channel string, held bool, achannel, encKind, path string) string {
+	enc := encoderChain(encKind, r.Codec, Bitrate(r, o), o.FPS)
 	mux, muxProps := "mp4mux", "fragment-duration=1000 streamable=true"
 	switch container(r) {
 	case "mkv":
@@ -265,7 +361,15 @@ func RecordingPipeline(r project.Recording, o project.Output, channel string, he
 	case "mov":
 		mux = "qtmux"
 	}
-	src := channelSource(channel, held, o) + " ! queue ! videoconvert ! " + enc
+	src := channelSource(channel, held, o) + " ! queue ! " + enc
+	audio := ""
+	if achannel != "" {
+		ak := r.AudioKbps
+		if ak <= 0 {
+			ak = DefaultAudioKbps
+		}
+		audio = fmt.Sprintf(" interaudiosrc channel=%s ! %s ! queue ! audioconvert ! voaacenc bitrate=%d ! aacparse ! queue ! ", quote(achannel), audioCaps, ak*1000)
+	}
 	if r.SegmentS > 0 || r.SegmentMB > 0 {
 		var lim string
 		if r.SegmentS > 0 {
@@ -278,13 +382,66 @@ func RecordingPipeline(r project.Recording, o project.Output, channel string, he
 		if muxProps != "" {
 			mp = fmt.Sprintf(` muxer-properties="properties,%s"`, strings.ReplaceAll(muxProps, " ", ","))
 		}
-		return fmt.Sprintf(`%s ! splitmuxsink name=out muxer-factory=%s%s sink-properties="properties,buffer-mode=unbuffered" start-index=1 location=%s%s`,
-			src, mux, mp, quote(SegmentPattern(path)), lim)
+		if audio != "" {
+			audio += "mux.audio_%u"
+		}
+		return fmt.Sprintf(`%s ! splitmuxsink name=mux muxer-factory=%s%s sink-properties="properties,buffer-mode=unbuffered" start-index=1 location=%s%s%s`,
+			src, mux, mp, quote(SegmentPattern(path)), lim, audio)
 	}
 	if muxProps != "" {
 		mux += " " + muxProps
 	}
-	return fmt.Sprintf("%s ! %s ! filesink name=out buffer-mode=unbuffered location=%s", src, mux, quote(path))
+	if audio != "" {
+		audio += "mux."
+	}
+	return fmt.Sprintf("%s ! %s name=mux ! filesink name=out buffer-mode=unbuffered location=%s%s", src, mux, quote(path), audio)
+}
+
+// StreamTarget is where a stream goes: an RTMP URL with its key, or the SRT URL with its latency.
+func StreamTarget(st project.Stream) string {
+	u := st.URL
+	if streamKind(u) == "srt" {
+		if !strings.Contains(u, "latency=") {
+			sep := "?"
+			if strings.Contains(u, "?") {
+				sep = "&"
+			}
+			u += fmt.Sprintf("%slatency=%d", sep, latency(st.LatencyMS))
+		}
+		return u
+	}
+	if st.Key != "" {
+		u = strings.TrimSuffix(u, "/") + "/" + st.Key
+	}
+	return u
+}
+
+// StreamPipeline describes a stream of the program: picture and sound encoded (H.264 or, over
+// SRT, H.265; AAC), a key frame every streamGOP seconds, muxed as FLV to RTMP (rtmp2sink) or
+// MPEG-TS to SRT (srtsink, not waiting for a receiver).
+func StreamPipeline(st project.Stream, o project.Output, runID, encKind string) string {
+	r := project.Recording{BitrateKbps: st.VideoKbps, Codec: st.Codec}
+	enc := encoderChain(encKind, st.Codec, Bitrate(r, o), o.FPS*streamGOP)
+	ak := st.AudioKbps
+	if ak <= 0 {
+		ak = DefaultAudioKbps
+	}
+	mux := "flvmux name=mux streamable=true ! rtmp2sink name=out location=" + quote(StreamTarget(st))
+	if streamKind(st.URL) == "srt" {
+		mux = "mpegtsmux name=mux alignment=7 ! srtsink name=out wait-for-connection=false uri=" + quote(StreamTarget(st))
+	}
+	return fmt.Sprintf("%s ! queue ! %s ! queue ! %s interaudiosrc channel=%s ! %s ! queue ! audioconvert ! voaacenc bitrate=%d ! aacparse ! queue ! mux.",
+		channelSource(ProgramChannel(runID), false, o), enc, mux, quote(ProgramAudioChannel(runID)), audioCaps, ak*1000)
+}
+
+// WindowPipeline shows the program in a window on this computer; ListenPipeline plays the
+// program's sound on its speakers.
+func WindowPipeline(o project.Output, runID string) string {
+	return fmt.Sprintf("%s ! queue ! videoconvert ! autovideosink sync=false", channelSource(ProgramChannel(runID), false, o))
+}
+
+func ListenPipeline(runID string) string {
+	return fmt.Sprintf("interaudiosrc channel=%s ! %s ! queue ! audioconvert ! audioresample ! autoaudiosink", quote(ProgramAudioChannel(runID)), audioCaps)
 }
 
 // PreviewPipeline describes a channel's preview: a few JPEGs a second, PreviewWidth wide, into

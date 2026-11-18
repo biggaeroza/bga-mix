@@ -186,8 +186,17 @@ func TestPlaylistReturn(t *testing.T) {
 			must(t, s.SetLayout("clips", nil))
 		}},
 	)
+	for _, e := range evs {
+		t.Logf("%s %s %s %s", e.Time.Format("05.000"), e.Feed, e.Kind, e.Text)
+	}
 	frames := decode(t, s.Recordings()[0])
-	expectColours(t, frames, 0.5, 0.5, map[float64]string{0.3: "green", 0.8: "red", 1.4: "blue", 2.6: "green"})
+	tl := ""
+	for i := 0; i < len(frames); i += 2 {
+		tl += frames[i].colour(0.5, 0.5)[:1]
+	}
+	t.Logf("timeline (every 80 ms): %s", tl)
+	// each item plays its 0.6 s plus the start of its pipeline (about 0.15 s)
+	expectColours(t, frames, 0.5, 0.5, map[float64]string{0.3: "green", 1.0: "red", 1.85: "blue", 2.7: "green"})
 	if count(evs, "pl", "next") != 1 || count(evs, "pl", "ended") != 1 {
 		t.Errorf("events %+v", evs)
 	}

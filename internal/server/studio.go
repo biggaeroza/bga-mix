@@ -12,6 +12,7 @@ package server
 //	GET  /api/studio?after=N            running, the show's status, the events after N
 //	GET  /api/files?dir=                a folder's sub-folders, media and show files
 //	POST /api/browse         {kind, suggested}      a native dialog (desktop only)
+//	GET  /api/devices                   cameras and sound inputs
 //	GET  /api/media?path=               a media file's format and decode check
 //	GET  /api/media/thumb?path=         its thumbnail (JPEG)
 
@@ -39,7 +40,12 @@ func (s *Server) studioRoutes() {
 		writeJSON(w, 200, map[string]any{
 			"version": version.Program(), "native_dialogs": s.cfg.Dialogs != nil, "initial_path": s.cfg.InitialPath,
 			"home": home, "patterns": project.Patterns, "preview_fps": engine.PreviewFPS,
+			"encoders": engine.Encoders(), "stream_schemes": project.StreamSchemes,
 		})
+	})
+	m.HandleFunc("GET /api/devices", func(w http.ResponseWriter, r *http.Request) {
+		cams, audio := app.Devices()
+		writeJSON(w, 200, map[string]any{"cameras": cams, "audio_inputs": audio})
 	})
 	m.HandleFunc("POST /api/project/new", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"project": app.NewProject()})
