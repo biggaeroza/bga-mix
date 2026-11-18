@@ -64,6 +64,6 @@ people who would rather click than script. If Snowmix's scripting suits you, use
 
 ## Licence
 
-MIT (see [LICENSE](LICENSE)). The dependencies BGAMix links (GStreamer and its Go bindings,
-LGPL-2.1, dynamically linked) are listed with their licences in
+MIT (see [LICENSE](LICENSE)). BGAMix uses GStreamer (LGPL-2.1, dynamically linked system
+libraries) through MIT-licensed Go bindings; every dependency is listed with its licence in
 [THIRD-PARTY.md](THIRD-PARTY.md).
