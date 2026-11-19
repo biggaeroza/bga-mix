@@ -616,6 +616,7 @@ func contains(l []string, s string) bool {
 }
 
 func resolve(dir, p string) string {
+	p = ExpandHome(p)
 	if filepath.IsAbs(p) {
 		return p
 	}

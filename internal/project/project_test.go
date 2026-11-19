@@ -74,3 +74,26 @@ func TestMissingFile(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	if got := VideosDir(); got != filepath.Join(home, "Videos") {
+		t.Errorf("no user-dirs: %s", got)
+	}
+	os.MkdirAll(filepath.Join(home, ".config"), 0o755)
+	os.WriteFile(filepath.Join(home, ".config", "user-dirs.dirs"), []byte("# x\nXDG_VIDEOS_DIR=\"$HOME/Vidéos\"\n"), 0o644)
+	if got := VideosDir(); got != filepath.Join(home, "Vidéos") {
+		t.Errorf("user-dirs: %s", got)
+	}
+	if got := UnsavedRecordingsDir(); got != filepath.Join(home, "Vidéos", "BGAMix") {
+		t.Error(got)
+	}
+	if got := Resolve("/show", "~/rec/a.mp4"); got != filepath.Join(home, "rec", "a.mp4") {
+		t.Errorf("~: %s", got)
+	}
+	if got := Resolve("/show", "rec/a.mp4"); got != "/show/rec/a.mp4" {
+		t.Error(got)
+	}
+}

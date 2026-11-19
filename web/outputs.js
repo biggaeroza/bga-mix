@@ -43,7 +43,7 @@ export function render(el, ctx) {
       h("button", { onclick: () => ctx.edit(() => (p.recordings ||= []).push({ path: "recordings/{project}-{date}-{time}" })) }, "+ Add a recording")),
       (p.recordings || []).length ? (p.recordings || []).map((r, i) => recording(ctx, r, i))
         : h("p.dim", {}, "No recordings: the show is only mixed (and previewed). Feeds can also be recorded clean on their own (Feeds tab, ISO)."),
-      h("p.dim", {}, "MP4 and MOV are written so that a recording cut short by a crash or power cut still plays up to its last second. A file never overwrites an earlier one (-2, -3 … are added). Paths are relative to the show file.")),
+      h("p.dim", {}, "MP4 and MOV are written so that a recording cut short by a crash or power cut still plays up to its last second. A file never overwrites an earlier one (-2, -3 … are added). Relative paths go next to the show file, or for a show not yet saved, in BGAMix in your videos folder; ~/ is your home folder.")),
     h("section.panel", {}, h("div.editor-head", {}, h("h2", {}, "Streams"),
       h("button", { onclick: () => ctx.edit(() => (p.streams ||= []).push({ name: "YouTube", url: "rtmp://a.rtmp.youtube.com/live2", manual: true })) }, "+ Add a stream")),
       (p.streams || []).length ? p.streams.map((st, i) => stream(ctx, st, i))
@@ -94,7 +94,8 @@ function recording(ctx, r, i) {
   return h("fieldset.rec", {}, h("legend", {}, `program-${i + 1}`),
     h("div.grid3", {},
       h("label.field.span2", {}, h("span.label", {}, "File"), h("input", { type: "text", value: r.path, oninput: (e) => ctx.edit(() => { r.path = e.target.value; }, false) }),
-        h("span.hint", {}, "{project} {date} {time}; the extension follows the container")),
+        h("span.hint", {}, "{project} {date} {time}; the extension follows the container. ",
+          ctx.st.path ? "Relative to the show's folder." : `This show is not saved yet: relative to ${ctx.st.meta.unsaved_recordings || "~/Videos/BGAMix"}.`)),
       h("label.field", {}, h("span.label", {}, "Start"), h("select", { onchange: (e) => set("manual", e.target.value === "1") },
         h("option", { value: "", selected: !r.manual }, "with the show"), h("option", { value: "1", selected: !!r.manual }, "by hand (switcher)"))),
       h("label.field", {}, h("span.label", {}, "Container"), h("select", { onchange: (e) => set("container", e.target.value === "mp4" ? "" : e.target.value) },

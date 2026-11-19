@@ -45,6 +45,7 @@ func (s *Server) studioRoutes() {
 			"version": version.Program(), "native_dialogs": s.cfg.Dialogs != nil, "initial_path": s.cfg.InitialPath,
 			"home": home, "patterns": project.Patterns, "preview_fps": engine.PreviewFPS,
 			"encoders": engine.Encoders(), "stream_schemes": project.StreamSchemes,
+			"unsaved_recordings": project.UnsavedRecordingsDir(),
 		})
 	})
 	// an overlay drawn as it will look on the output (the editor's preview)

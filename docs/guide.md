@@ -196,8 +196,10 @@ Every feed with sound (clips, playlists, network streams, sound inputs) goes to 
 Outputs → **+ Add a recording**:
 
 - **File name:** `{project}`, `{date}` and `{time}` are filled in when it starts; the extension
-  follows the container. Relative names go next to the show file. A recording never overwrites
-  another: `-2`, `-3` … are added.
+  follows the container. Relative names go next to the show file; a show not yet saved records in
+  `BGAMix` in your videos folder (usually `~/Videos/BGAMix`). `~/` stands for your home folder. A
+  recording never overwrites another: `-2`, `-3` … are added. The Log tab shows each file's full
+  path when it starts.
 - **Container:**
   - **MP4** and **MOV** are written so that a recording cut short by a crash or power cut still
     plays up to its last second.

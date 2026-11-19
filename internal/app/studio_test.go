@@ -113,6 +113,13 @@ func TestStartStop(t *testing.T) {
 	if !strings.HasPrefix(k, "started layout") || !strings.HasSuffix(k, "stopped") || seq != len(evs) {
 		t.Errorf("events %s (seq %d)", k, seq)
 	}
+	seen := map[string]int{}
+	for _, e := range evs {
+		seen[e.Kind+" "+e.Text+" "+e.Time.String()]++
+		if seen[e.Kind+" "+e.Text+" "+e.Time.String()] > 1 {
+			t.Errorf("logged twice: %s %s", e.Kind, e.Text)
+		}
+	}
 	if later, _ := s.Events(seq - 1); len(later) != 1 {
 		t.Errorf("after %d: %d", seq-1, len(later))
 	}

@@ -113,19 +113,16 @@ func (s *Studio) Start(p *project.Project, path string) error {
 	if err != nil {
 		return err
 	}
-	events, _ := show.Subscribe()
 	s.mu.Lock()
 	s.show, s.showPath = show, path
 	s.mu.Unlock()
-	go func() { // the show's subscription lives as long as the show
-		for e := range events {
+	// the show's own subscription, made as it was created, has every event from the first one;
+	// it is the only one read (reading a second as well logged everything twice)
+	go func() {
+		for e := range show.Events() {
 			s.addEvent(e)
 		}
 	}()
-	// the events emitted while starting came before this subscription
-	for len(show.Events()) > 0 {
-		s.addEvent(<-show.Events())
-	}
 	return nil
 }
 
@@ -147,10 +144,11 @@ func (s *Studio) Stop() {
 	s.mu.Unlock()
 	if show != nil {
 		show.Stop()
-		time.Sleep(50 * time.Millisecond) // let the subscription deliver "stopped"
-		for len(show.Events()) > 0 {
-			s.addEvent(<-show.Events())
+		// let the reader log the last events ("stopped")
+		for t0 := time.Now(); len(show.Events()) > 0 && time.Since(t0) < time.Second; {
+			time.Sleep(10 * time.Millisecond)
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

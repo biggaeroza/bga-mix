@@ -2,6 +2,7 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +112,9 @@ func TestFreePath(t *testing.T) {
 
 func TestRecordingPath(t *testing.T) {
 	p := testProject()
+	if got := RecordingPath(project.Recording{Path: "recordings/x"}, p, "", "", time.Now()); got != filepath.Join(project.UnsavedRecordingsDir(), "recordings", "x.mp4") {
+		t.Errorf("unsaved show: %s", got)
+	}
 	at := time.Date(2026, 11, 18, 9, 5, 7, 0, time.UTC)
 	if got := RecordingPath(p.Recordings[0], p, "", "/show", at); got != "/show/rec/My-Show-2026-11-18.mp4" {
 		t.Errorf("%s", got)

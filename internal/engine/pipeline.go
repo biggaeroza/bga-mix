@@ -271,13 +271,17 @@ func channelSource(channel string, held bool, o project.Output) string {
 	return fmt.Sprintf("intervideosrc channel=%s%s ! %s", quote(channel), timeout, caps(o))
 }
 
-// RecordingPath expands a recording's path ({project}, {feed}, {date}, {time}) against the
-// project's folder, adding the container's extension when the path has none.
+// RecordingPath expands a recording's path ({project}, {feed}, {date}, {time}, a leading ~)
+// against the project's folder (an unsaved show, dir "": BGAMix in the user's videos folder),
+// adding the container's extension when the path has none.
 func RecordingPath(r project.Recording, p *project.Project, feed, dir string, at time.Time) string {
 	name := strings.NewReplacer("{project}", safeName(p.Name), "{feed}", safeName(feed), "{date}", at.Format("2006-01-02"),
 		"{time}", at.Format("15-04-05")).Replace(r.Path)
 	if filepath.Ext(name) == "" {
 		name += "." + container(r)
+	}
+	if dir == "" {
+		dir = project.UnsavedRecordingsDir()
 	}
 	return project.Resolve(dir, name)
 }
