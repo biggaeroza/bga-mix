@@ -235,3 +235,9 @@ input[type=color] { width: 44px; height: 30px; padding: 2px; border: 1px solid v
 .ov-row button.on { background: var(--live); color: #fff; border-color: var(--live); }
 .ov-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
 .ov-dot.on { background: var(--live); }
+
+/* connected devices, under the feed list */
+.connected { border-top: 1px solid var(--line); margin-top: 6px; padding: 8px 4px 2px; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.connected-head { display: flex; justify-content: space-between; align-items: center; }
+.connected-row { display: flex; gap: 6px; align-items: center; }
+.connected-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

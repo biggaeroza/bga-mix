@@ -9,12 +9,44 @@ const HAS_AUDIO = new Set(["file", "playlist", "stream", "audio"]);
 export const hasVideo = (f) => f.type !== "audio";
 const AUDIO_MODES = { follow: "Follows the picture (heard while on air)", on: "Always heard", off: "Off" };
 
-let devices = null; // {cameras, audio_inputs}, fetched once per page
+// devices: {cameras, audio_inputs}, looked up again when older than a few seconds, so that a
+// camera plugged in while BGAMix is open appears
+let devices = null, devicesAt = 0;
 async function getDevices(refresh) {
-  if (!devices || refresh) {
+  if (!devices || refresh || Date.now() - devicesAt > 4000) {
     try { devices = await api("devices"); } catch { devices = { cameras: [], audio_inputs: [] }; }
+    devicesAt = Date.now();
   }
   return devices;
+}
+
+// connectedBox lists the cameras and sound inputs plugged in that no feed uses yet, each with
+// an Add button.
+function connectedBox(ctx) {
+  const box = h("div.connected", {}, h("div.dim", {}, "Looking for cameras and sound inputs…"));
+  const fill = async (refresh) => {
+    const d = await getDevices(refresh);
+    const p = ctx.st.project;
+    const used = (type, dev) => p.feeds.some((f) => f.type === type && (f.device || (type === "camera" ? "/dev/video0" : "")) === dev);
+    const cams = d.cameras.filter((c) => !used("camera", c.device));
+    const mics = d.audio_inputs.filter((a) => !used("audio", a.device) && !a.device.endsWith(".monitor"));
+    const name = (n) => n.replace(/ \(\/dev\/video\d+\)$/, "");
+    put(box,
+      h("div.connected-head", {}, h("strong", {}, "Connected"),
+        h("button.icon", { title: "Look again", onclick: () => fill(true) }, "⟳")),
+      cams.map((c) => h("div.connected-row", {}, h("span.grow", { title: c.device }, "📷\uFE0E ", name(c.name)),
+        h("button", { title: "Add it as a feed, with a full-screen layout of its own", onclick: () => {
+          const id = addFeed(ctx, { id: "cam", name: name(c.name), type: "camera", device: c.device });
+          ctx.edit((p) => p.layouts.push({ id: uniqueID(id, p.layouts.map((l) => l.id)), name: name(c.name), boxes: [{ feed: id, x: 0, y: 0, w: 1, h: 1 }] }));
+          toast(`Added ${name(c.name)} and a layout showing it full screen`);
+        } }, "Add"))),
+      mics.map((a) => h("div.connected-row", {}, h("span.grow", { title: a.device }, "🎙\uFE0E ", a.name),
+        h("button", { onclick: () => addFeed(ctx, { id: "mic", name: a.name, type: "audio", device: a.device }) }, "Add"))),
+      !cams.length && !mics.length ? h("div.dim", {}, d.cameras.length || d.audio_inputs.length
+        ? "Every camera and sound input connected is in use." : "No camera found. Plug one in, then ⟳.") : null);
+  };
+  fill(false);
+  return box;
 }
 const ENDS = { loop: "Loop", hold: "Hold the last frame", black: "Go black", return: "Return to the previous layout" };
 
@@ -78,7 +110,8 @@ export function render(el, ctx) {
         h("span.updown", {},
           h("button.icon", { title: "Up", disabled: i === 0, onclick: (e) => { e.stopPropagation(); ctx.edit((p) => p.feeds.splice(i - 1, 0, p.feeds.splice(i, 1)[0])); } }, "▲"),
           h("button.icon", { title: "Down", disabled: i === p.feeds.length - 1, onclick: (e) => { e.stopPropagation(); ctx.edit((p) => p.feeds.splice(i + 1, 0, p.feeds.splice(i, 1)[0])); } }, "▼")))) :
-        h("p.dim.pad", {}, "No feeds yet: add one, or add files from the Media tab.")),
+        h("p.dim.pad", {}, "No feeds yet: add one, or add files from the Media tab."),
+      connectedBox(ctx)),
     h("section.editor", {}, f ? editor(ctx, f) : h("p.dim", {}, "Choose a feed."))));
 }
 
