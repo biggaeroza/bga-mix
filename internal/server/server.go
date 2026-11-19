@@ -5,6 +5,7 @@
 //	POST /api/feeds/{id}/{command}           play, pause, restart, seek ({"seconds": 12.5}), next, previous
 //	POST /api/feeds/{id}/audio               {"volume_db": -6, "mute": false, "mode": "follow|on|off"} (any of them)
 //	POST /api/recordings/{label}/{command}   start, stop, pause, resume ("program-1" …, "iso-<feed>", "stream-1" …)
+//	POST /api/overlays/{id}                  {"on": true, "text": "…", "subtitle": "…", "for_s": 8} (any of them)
 //	POST /api/monitor/{window|listen}        {"on": true}: the program in a window / its sound on the speakers
 //	GET  /api/levels                         the meters: {"program": {"peak_db", "rms_db"}, "<feed>": …}
 //	GET  /api/preview/{key}                  the latest JPEG of "program" or a feed
@@ -87,6 +88,7 @@ func NewServer(cfg Config) *Server {
 	s.mux.HandleFunc("POST /api/feeds/{id}/{cmd}", s.withShow(s.feed))
 	s.mux.HandleFunc("POST /api/feeds/{id}/audio", s.withShow(s.audio))
 	s.mux.HandleFunc("POST /api/monitor/{kind}", s.withShow(s.monitor))
+	s.mux.HandleFunc("POST /api/overlays/{id}", s.withShow(s.overlayCmd))
 	s.mux.HandleFunc("GET /api/levels", s.withShow(func(sh *engine.Show, w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, sh.Levels()) }))
 	s.mux.HandleFunc("POST /api/recordings/{label}/{cmd}", s.withShow(s.recording))
 	s.mux.HandleFunc("GET /api/preview/{key}", s.withShow(s.preview))
@@ -238,6 +240,24 @@ func (s *Server) audio(show *engine.Show, w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := show.AudioCommand(r.PathValue("id"), req.VolumeDB, req.Mute, req.Mode); err != nil {
+		commandErr(w, err)
+		return
+	}
+	writeJSON(w, 200, show.Status())
+}
+
+func (s *Server) overlayCmd(show *engine.Show, w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		On       *bool   `json:"on"`
+		Text     *string `json:"text"`
+		Subtitle *string `json:"subtitle"`
+		ForS     float64 `json:"for_s"`
+	}
+	if err := readBody(r, &req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := show.OverlayCommand(r.PathValue("id"), req.On, req.Text, req.Subtitle, req.ForS); err != nil {
 		commandErr(w, err)
 		return
 	}

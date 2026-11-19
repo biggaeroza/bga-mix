@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "Studio",
+  "notes": "Test patterns standing in for two cameras, a lower third, a clock and a title, switched between three layouts. Runs anywhere: no media needed. Replace the test feeds with your cameras.",
+  "output": { "width": 1280, "height": 720, "fps": 30 },
+  "feeds": [
+    { "id": "cam1", "name": "Camera 1", "type": "test", "pattern": "smpte" },
+    { "id": "cam2", "name": "Camera 2", "type": "test", "pattern": "ball" },
+    { "id": "tone", "name": "Tone", "type": "audio", "pattern": "tone", "volume_db": -18, "mute": true }
+  ],
+  "layouts": [
+    { "id": "cam1", "name": "Camera 1", "boxes": [ { "feed": "cam1", "x": 0, "y": 0, "w": 1, "h": 1 } ] },
+    { "id": "two", "name": "Interview", "boxes": [
+      { "feed": "cam1", "x": 0, "y": 0.25, "w": 0.5, "h": 0.5 },
+      { "feed": "cam2", "x": 0.5, "y": 0.25, "w": 0.5, "h": 0.5 } ] },
+    { "id": "pip", "name": "Picture in picture", "boxes": [
+      { "feed": "cam1", "x": 0, "y": 0, "w": 1, "h": 1 },
+      { "feed": "cam2", "x": 0.66, "y": 0.05, "w": 0.3, "h": 0.3 } ] }
+  ],
+  "transition": { "kind": "mix", "duration_s": 0.5 },
+  "overlays": [
+    { "id": "title", "name": "Title", "type": "text", "text": "BGAMix studio", "x": 0.04, "y": 0.06, "size": 0.06, "background": "#00000099", "layouts": ["two"] },
+    { "id": "clock", "name": "Clock", "type": "clock", "format": "time_hm", "x": 0.88, "y": 0.9, "size": 0.04, "background": "#00000080" },
+    { "id": "guest", "name": "Guest", "type": "lower_third", "text": "Ada Lovelace", "subtitle": "Mathematician", "x": 0.05, "y": 0.77, "hidden": true }
+  ],
+  "recordings": [ { "path": "recordings/{project}-{date}-{time}", "manual": true } ]
+}

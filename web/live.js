@@ -62,6 +62,7 @@ export function render(el, ctx) {
   const streamRows = h("div.recs", {});
   const progMeter = meter("program");
   const monitor = h("div.row.wrap", {});
+  const ovRows = h("div.ov-rows", {}, (s.overlays || []).map((o) => overlayRow(o)));
   el.append(h("div.live", {},
     h("section.program", {},
       h("div.prog-frame", { style: { aspectRatio: `${s.output.width} / ${s.output.height}` } }, preview("program", fps, "prog"), h("span.onair-tag", {}, "PROGRAM")),
@@ -69,12 +70,13 @@ export function render(el, ctx) {
     h("aside.side", {},
       h("section.panel", {}, h("h3", {}, "Transition"), h("div.row.wrap", {}, mode, h("label.row", {}, "mix ", dur, " s"))),
       h("section.panel", {}, h("h3", {}, "Recordings"), recRows),
+      (s.overlays || []).length ? h("section.panel", {}, h("h3", {}, "Overlays"), ovRows) : null,
       s.streams.length ? h("section.panel", {}, h("h3", {}, "Streams"), streamRows) : null,
       h("section.panel", {}, h("h3", {}, "On this computer"), monitor)),
     h("section.layouts-row", {}, h("h3", {}, "Layouts"), h("div.takes", {}, layoutBtns)),
     h("section.feeds-row", {}, h("h3", {}, "Feeds"), h("div.feed-cards", {}, feedCards.map((c) => c.el)))));
 
-  built = { progInfo, layoutBtns, feedCards, recRows, recKey: "", streamRows, streamKey: "", monitor, monKey: "", meters: { program: progMeter } };
+  built = { ovRows, progInfo, layoutBtns, feedCards, recRows, recKey: "", streamRows, streamKey: "", monitor, monKey: "", meters: { program: progMeter } };
   for (const c of feedCards) if (c.meter) built.meters[c.id] = c.meter;
   // the meters: 8 readings a second
   meterTimer = setInterval(async () => {
@@ -199,6 +201,16 @@ export function update(ctx) {
     built.recKey = key;
     put(built.recRows, ...(s.recordings.length ? s.recordings.map((r) => recRow(r)) : [h("p.dim", {}, "None in this show.")]));
   }
+  for (const o of s.overlays || []) {
+    const row = built.ovRows.querySelector(`[data-id="${o.id}"]`);
+    if (!row) continue;
+    row.querySelector(".ov-dot").classList.toggle("on", o.visible);
+    const b = row.querySelector("button.toggle");
+    b.classList.toggle("on", o.on);
+    b.textContent = o.on ? "On air" : "Show";
+    b.title = o.on ? "Hide it" : "Show it";
+    row.querySelector(".where").textContent = o.on && !o.visible ? "on, but not on this layout" : "";
+  }
   const sk = s.streams.map((x) => x.label + x.state + (x.error || "")).join();
   if (sk !== built.streamKey) {
     built.streamKey = sk;
@@ -222,6 +234,24 @@ export function update(ctx) {
     const row = built.recRows.querySelector(`[data-label="${r.label}"] .figs`);
     if (row) row.textContent = r.state === "recording" || r.state === "paused" ? `${duration(r.elapsed_s)} · ${bytes(r.bytes)}` : r.files?.length ? `${r.files.length} file(s)` : "";
   }
+}
+
+// overlayRow switches an overlay; a lower third or text also takes new words live.
+function overlayRow(o) {
+  const cmd = async (body) => {
+    try { await api(`overlays/${encodeURIComponent(o.id)}`, body); } catch (e) { toast(e.message, "bad"); }
+  };
+  const words = o.type === "lower_third" || o.type === "text";
+  const t1 = words ? h("input", { type: "text", value: o.text || "", "aria-label": "Text", placeholder: o.type === "lower_third" ? "Name" : "Text" }) : null;
+  const t2 = o.type === "lower_third" ? h("input", { type: "text", value: o.subtitle || "", "aria-label": "Title", placeholder: "Title" }) : null;
+  const send = (extra) => cmd({ ...(t1 ? { text: t1.value } : {}), ...(t2 ? { subtitle: t2.value } : {}), ...extra });
+  for (const i of [t1, t2]) if (i) i.addEventListener("keydown", (e) => { if (e.key === "Enter") send({}); });
+  return h("div.ov-row", { "data-id": o.id },
+    h("div.head", {}, h("span.ov-dot", {}), h("span.grow", {}, o.name || o.id),
+      words ? h("button", { title: "Show it for 8 seconds, then hide it", onclick: () => send({ for_s: 8 }) }, "8 s") : null,
+      h("button.toggle", { onclick: (e) => cmd({ on: !e.currentTarget.classList.contains("on") }) }, "Show")),
+    t1, t2,
+    words ? h("div.row", {}, h("span.dim.where", {}), h("span.grow", {}), h("button", { title: "Put these words on it (Enter)", onclick: () => send({}) }, "Update")) : h("span.dim.where", {}));
 }
 
 function streamRow(x) {

@@ -6,6 +6,7 @@ import { pick, setNative } from "./pick.js";
 import * as feeds from "./feeds.js";
 import * as media from "./media.js";
 import * as layouts from "./layouts.js";
+import * as overlays from "./overlays.js";
 import * as outputs from "./outputs.js";
 import * as live from "./live.js";
 import * as log from "./log.js";
@@ -15,6 +16,7 @@ const TABS = [
   { id: "feeds", label: "Feeds", mod: feeds },
   { id: "media", label: "Media", mod: media },
   { id: "layouts", label: "Layouts", mod: layouts },
+  { id: "overlays", label: "Overlays", mod: overlays },
   { id: "outputs", label: "Outputs", mod: outputs },
   { id: "log", label: "Log", mod: log },
 ];

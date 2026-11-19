@@ -10,12 +10,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -36,7 +38,67 @@ type Project struct {
 	Recordings []Recording `json:"recordings,omitempty"`
 	// Streams send the program (picture and sound) to a server.
 	Streams []Stream `json:"streams,omitempty"`
+	// Overlays are drawn over the program, above every feed, in order (later on top).
+	Overlays []Overlay `json:"overlays,omitempty"`
 }
+
+// Overlay types.
+const (
+	OverlayText       = "text"        // a line of text, optionally on a box
+	OverlayClock      = "clock"       // the time of day
+	OverlayImage      = "image"       // a picture file (PNG transparency kept): a logo, a bug
+	OverlayLowerThird = "lower_third" // a name and a title on a bar, for introducing people
+)
+
+// Clock formats.
+var ClockFormats = map[string]string{
+	"time":      "15:04:05",
+	"time_hm":   "15:04",
+	"date_time": "2006-01-02 15:04:05",
+	"date":      "2 January 2006",
+}
+
+// Overlay is something drawn over the program: text, a clock, an image or a lower third. It is
+// shown when the operator has it on (it starts on unless Hidden) and the layout on air is one
+// of Layouts (none listed: every layout); it fades in and out over FadeS.
+type Overlay struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	Type string `json:"type"` // text, clock, image, lower_third
+	// text: the text; lower_third: its first line (a name)
+	Text string `json:"text,omitempty"`
+	// lower_third: its second line (a title, a place)
+	Subtitle string `json:"subtitle,omitempty"`
+	// clock: time (default), time_hm, date_time, date
+	Format string `json:"format,omitempty"`
+	// image: the file, relative to the project file
+	Path string `json:"path,omitempty"`
+	// X, Y: the top-left corner, in fractions of the output picture
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	// W: an image's width (its height follows its shape), a lower third's bar (default 0.45),
+	// in fractions of the output's width
+	W float64 `json:"w,omitempty"`
+	// Size: the text's height in fractions of the output's height (default 0.05)
+	Size float64 `json:"size,omitempty"`
+	// Colours, as #rgb, #rrggbb or #rrggbbaa: the text (default white), the box behind it
+	// (text and clock: none by default; lower third: #000000c0) and a lower third's accent
+	// strip (default #e53935)
+	Colour     string `json:"colour,omitempty"`
+	Background string `json:"background,omitempty"`
+	Accent     string `json:"accent,omitempty"`
+	// Opacity 0 to 1 (default 1)
+	Opacity *float64 `json:"opacity,omitempty"`
+	// Layouts it is shown on (empty: all)
+	Layouts []string `json:"layouts,omitempty"`
+	// Hidden: it starts off, to be shown by the operator
+	Hidden bool `json:"hidden,omitempty"`
+	// FadeS: how long it fades in and out (default 0.3 s)
+	FadeS float64 `json:"fade_s,omitempty"`
+}
+
+// DefaultFadeS is an overlay's fade when none is given.
+const DefaultFadeS = 0.3
 
 // Stream sends the program to a streaming server or another machine.
 type Stream struct {
@@ -377,10 +439,88 @@ func (p *Project) Validate(dir string) error {
 			add(at+".latency_ms", "0 to 10000")
 		}
 	}
+	ovs := map[string]bool{}
+	for i, ov := range p.Overlays {
+		at := fmt.Sprintf("overlays[%d]", i)
+		if !idRe.MatchString(ov.ID) {
+			add(at+".id", "letters, digits, - and _, up to 40 characters")
+		} else if ovs[ov.ID] {
+			add(at+".id", "%q is used by another overlay", ov.ID)
+		}
+		ovs[ov.ID] = true
+		switch ov.Type {
+		case OverlayText:
+			if strings.TrimSpace(ov.Text) == "" {
+				add(at+".text", "give the text")
+			}
+		case OverlayLowerThird:
+			if strings.TrimSpace(ov.Text) == "" && strings.TrimSpace(ov.Subtitle) == "" {
+				add(at+".text", "give a name or a title")
+			}
+		case OverlayClock:
+			if _, ok := ClockFormats[ov.Format]; ov.Format != "" && !ok {
+				add(at+".format", "time, time_hm, date_time or date")
+			}
+		case OverlayImage:
+			if ov.Path == "" {
+				add(at+".path", "give the image")
+			} else if dir != "" {
+				if _, err := os.Stat(resolve(dir, ov.Path)); err != nil {
+					add(at+".path", "%v", err)
+				}
+			}
+		default:
+			add(at+".type", "text, clock, image or lower_third")
+		}
+		if ov.X < 0 || ov.X >= 1 || ov.Y < 0 || ov.Y >= 1 {
+			add(at, "x and y must be from 0 to below 1 (fractions of the output)")
+		}
+		if ov.W < 0 || ov.W > 1 {
+			add(at+".w", "0 (the default) to 1")
+		}
+		if ov.Size < 0 || ov.Size > 0.5 {
+			add(at+".size", "0 (the default, 0.05) to 0.5 of the picture's height")
+		}
+		for k, c := range map[string]string{"colour": ov.Colour, "background": ov.Background, "accent": ov.Accent} {
+			if _, ok := ParseColour(c); c != "" && !ok {
+				add(at+"."+k, "#rgb, #rrggbb or #rrggbbaa")
+			}
+		}
+		if ov.Opacity != nil && (*ov.Opacity < 0 || *ov.Opacity > 1) {
+			add(at+".opacity", "0 to 1")
+		}
+		if ov.FadeS < 0 || ov.FadeS > 10 {
+			add(at+".fade_s", "0 to 10 s")
+		}
+		for k, l := range ov.Layouts {
+			if !layouts[l] {
+				add(fmt.Sprintf("%s.layouts[%d]", at, k), "no layout %q", l)
+			}
+		}
+	}
 	if len(ps) > 0 {
 		return ps
 	}
 	return nil
+}
+
+// ParseColour reads #rgb, #rrggbb or #rrggbbaa.
+func ParseColour(s string) (color.NRGBA, bool) {
+	h := strings.TrimPrefix(s, "#")
+	if len(h) == 3 {
+		h = string([]byte{h[0], h[0], h[1], h[1], h[2], h[2]})
+	}
+	if len(h) == 6 {
+		h += "ff"
+	}
+	if len(h) != 8 || !strings.HasPrefix(s, "#") {
+		return color.NRGBA{}, false
+	}
+	v, err := strconv.ParseUint(h, 16, 32)
+	if err != nil {
+		return color.NRGBA{}, false
+	}
+	return color.NRGBA{uint8(v >> 24), uint8(v >> 16), uint8(v >> 8), uint8(v)}, true
 }
 
 func validEnd(e string) bool {

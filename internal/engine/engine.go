@@ -66,6 +66,8 @@ type Show struct {
 	levels   map[string]Level   // meters: "program" and feeds
 	window   gst.Pipeline       // the program window on this computer (nil: closed)
 	listen   gst.Pipeline       // the program's sound on the speakers (nil: off)
+	ovs      []*ovRun           // the overlays
+	ovDir    string             // their pictures
 	layout   string
 	previous string
 	cur      map[string]PadProps // the placements applied (before blanking)
@@ -216,7 +218,12 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 		s.shutdownLocked()
 		return nil, errors.New("the sound mixer did not start")
 	}
-	mixer, err := launch(MixerPipeline(p, start, s.runID))
+	ovEls, err := s.startOverlaysLocked()
+	if err != nil {
+		s.shutdownLocked()
+		return nil, fmt.Errorf("overlays: %w", err)
+	}
+	mixer, err := launch(MixerPipeline(p, start, s.runID, ovEls))
 	if err != nil {
 		s.shutdownLocked()
 		return nil, fmt.Errorf("mixer: %w", err)
@@ -239,9 +246,9 @@ func Start(p *project.Project, dir string, o Options) (*Show, error) {
 	}
 	s.applyLocked()
 	if o.Previews {
-		s.startPreview("program", ProgramChannel(s.runID), false)
+		s.startPreview("program", ProgramChannel(s.runID), false, ProgramPreviewWidth)
 		for _, f := range VideoFeeds(p) {
-			s.startPreview(f.ID, FeedChannel(s.runID, f.ID), Held(f))
+			s.startPreview(f.ID, FeedChannel(s.runID, f.ID), Held(f), PreviewWidth)
 		}
 	}
 	for i, r := range p.Recordings {
@@ -307,6 +314,14 @@ func (s *Show) shutdownLocked() {
 	}
 	if s.mixer != nil {
 		s.mixer.SetState(gst.StateNull)
+	}
+	for _, r := range s.ovs {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+	}
+	if s.ovDir != "" {
+		os.RemoveAll(s.ovDir)
 	}
 	for _, pl := range []gst.Pipeline{s.amixer, s.window, s.listen} {
 		if pl != nil {
@@ -459,6 +474,7 @@ func (s *Show) setLayoutLocked(id string, t *project.Transition) error {
 		s.previous = s.layout
 	}
 	s.layout = id
+	s.updateOverlaysLocked()
 	target := Place(s.p, l)
 	targetW := visible(l)
 	s.transGen++
@@ -1117,8 +1133,8 @@ type preview struct {
 	at   time.Time
 }
 
-func (s *Show) startPreview(key, channel string, held bool) {
-	pl, err := launch(PreviewPipeline(s.p.Output, channel, held))
+func (s *Show) startPreview(key, channel string, held bool, width int) {
+	pl, err := launch(PreviewPipeline(s.p.Output, channel, held, width))
 	if err != nil {
 		s.emit(Event{Kind: "warning", Text: "preview " + key + ": " + err.Error()})
 		return
@@ -1228,6 +1244,7 @@ type Status struct {
 	Previews      bool              `json:"previews,omitempty"`
 	Streams       []StreamStatus    `json:"streams"`
 	ProgramLevel  *Level            `json:"program_level,omitempty"`
+	Overlays      []OverlayStatus   `json:"overlays"`
 	Window        bool              `json:"window,omitempty"`
 	Listen        bool              `json:"listen,omitempty"`
 }
@@ -1273,6 +1290,7 @@ func (s *Show) Status() Status {
 		st.ProgramLevel = &lv
 	}
 	st.Window, st.Listen = s.window != nil, s.listen != nil
+	st.Overlays = s.overlayStatusLocked()
 	for _, rr := range s.recs {
 		if rr.stream != nil {
 			ss := StreamStatus{Label: rr.label, Name: rr.stream.Name, URL: StreamDisplay(*rr.stream), State: rr.state, Error: rr.lastErr, Encoder: rr.encoder}

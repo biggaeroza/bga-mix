@@ -43,10 +43,12 @@ const bitsPerPixel = 0.15
 // (1 s) turns a feed that stops into black.
 const holdTimeout = uint64(1) << 60
 
-// Previews are small JPEGs of the program and each feed, for the UI.
+// Previews are small JPEGs of the program and each feed, for the UI (the program's larger: it
+// is shown large).
 const (
-	PreviewWidth = 320
-	PreviewFPS   = 5
+	PreviewWidth        = 320
+	ProgramPreviewWidth = 640
+	PreviewFPS          = 5
 )
 
 func caps(o project.Output) string {
@@ -224,9 +226,9 @@ func VideoFeeds(p *project.Project) []project.Feed {
 }
 
 // MixerPipeline describes the mixer: an intervideosrc per feed with a picture (in project
-// order) into the compositor, placed by the layout, into the program channel. The compositor
+// order) into the compositor, placed by the layout, then the overlays, into the program channel. The compositor
 // takes its start time from its first input (otherwise its first frames carry no timestamps).
-func MixerPipeline(p *project.Project, l *project.Layout, runID string) string {
+func MixerPipeline(p *project.Project, l *project.Layout, runID string, ovs []OverlayElement) string {
 	o := p.Output
 	place := Place(p, l)
 	vf := VideoFeeds(p)
@@ -237,7 +239,7 @@ func MixerPipeline(p *project.Project, l *project.Layout, runID string) string {
 		fmt.Fprintf(&b, " sink_%d::xpos=%d sink_%d::ypos=%d sink_%d::width=%d sink_%d::height=%d sink_%d::zorder=%d sink_%d::alpha=%g",
 			i, pp.X, i, pp.Y, i, pp.W, i, pp.H, i, pp.Z, i, pp.Alpha)
 	}
-	fmt.Fprintf(&b, " ! %s ! intervideosink channel=%s", caps(o), quote(ProgramChannel(runID)))
+	fmt.Fprintf(&b, " ! %s%s ! intervideosink channel=%s", caps(o), overlayChain(ovs), quote(ProgramChannel(runID)))
 	for i, f := range vf {
 		fmt.Fprintf(&b, " %s ! queue ! mix.sink_%d", channelSource(FeedChannel(runID, f.ID), Held(f), o), i)
 	}
@@ -446,8 +448,8 @@ func ListenPipeline(runID string) string {
 
 // PreviewPipeline describes a channel's preview: a few JPEGs a second, PreviewWidth wide, into
 // an appsink named "jpeg" that keeps only the latest.
-func PreviewPipeline(o project.Output, channel string, held bool) string {
-	h := even(float64(PreviewWidth) * float64(o.Height) / float64(o.Width))
+func PreviewPipeline(o project.Output, channel string, held bool, width int) string {
+	h := even(float64(width) * float64(o.Height) / float64(o.Width))
 	return fmt.Sprintf("%s ! videorate drop-only=true ! video/x-raw,framerate=%d/1 ! videoscale ! video/x-raw,width=%d,height=%d ! videoconvert ! jpegenc quality=75 ! appsink name=jpeg max-buffers=1 drop=true sync=false",
-		channelSource(channel, held, o), PreviewFPS, PreviewWidth, h)
+		channelSource(channel, held, o), PreviewFPS, width, h)
 }

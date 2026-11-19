@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BGAMix
+GenericName=Live video mixer
+Comment=Mix cameras, streams, video files and images live; record and stream the result
+Exec=bgamix-gui %f
+Icon=bgamix
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=video;mixer;switcher;live;stream;record;

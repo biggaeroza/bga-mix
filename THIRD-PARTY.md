@@ -7,6 +7,7 @@ BGAMix's own code is MIT-licensed (LICENSE). It uses:
 | [GStreamer](https://gstreamer.freedesktop.org/) and its plugins | LGPL-2.1 or later | dynamically linked system libraries; not distributed with BGAMix's source |
 | [go-gst](https://github.com/go-gst/go-gst) v0.0.3 and go-glib v0.0.4 (Go bindings for GStreamer and GLib, generated from GStreamer's GIR files) | MIT | Go modules, linked into the program (cgo). Its handwritten v1.x releases were retracted by the project (LGPL-licensed, "not licensed open enough"); BGAMix uses the current generated, MIT-licensed line |
 | Go standard library | BSD-3-Clause | |
+| [golang.org/x/image](https://pkg.go.dev/golang.org/x/image) v0.48.0, with the Go fonts (Bigelow & Holmes) | BSD-3-Clause | Go module: overlays are drawn with it (text in the Go fonts, image decoding and scaling) |
 | [gorilla/websocket](https://github.com/gorilla/websocket) v1.5.3 | BSD-2-Clause | Go module: the control API's WebSocket |
 | [Wails](https://wails.io) v2.16.0 and its dependencies (go.mod: labstack/echo, leaanthony/*, samber/lo, godbus, google/uuid … all MIT, BSD or Apache-2.0) | MIT | Go modules: the desktop window only (`cmd/bgamix-gui`, built with `-tags desktop`) |
 | WebKitGTK, GTK 3 | LGPL-2.1 or later | the desktop window's web view on Linux: dynamically linked system libraries |

@@ -222,3 +222,16 @@ button.mute.on { background: var(--live); color: #fff; border-color: var(--live)
 .prog-sound .meter { height: 14px; }
 .side button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .audio-row .meter { flex: none; }
+
+/* overlays */
+.ov-stage { background: repeating-conic-gradient(#2a2e33 0 25%, #1f2226 0 50%) 0 0 / 24px 24px; }
+.ov-pic { position: absolute; cursor: move; outline: 1px dashed var(--sel); user-select: none; touch-action: none; }
+input[type=color] { width: 44px; height: 30px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.ov-rows { display: flex; flex-direction: column; gap: 8px; }
+.ov-row { border-bottom: 1px solid var(--line); padding-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+.ov-row:last-child { border-bottom: 0; }
+.ov-row input { width: 100%; }
+.ov-row .head { display: flex; gap: 6px; align-items: center; }
+.ov-row button.on { background: var(--live); color: #fff; border-color: var(--live); }
+.ov-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
+.ov-dot.on { background: var(--live); }

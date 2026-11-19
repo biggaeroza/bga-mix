@@ -195,3 +195,31 @@ func TestDevicesAndAudioAPI(t *testing.T) {
 		t.Errorf("meta %v", v)
 	}
 }
+
+func TestOverlayAPI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs GStreamer")
+	}
+	srv, st := studioServer(t)
+	req := httptest.NewRequest("POST", "/api/overlay/render", strings.NewReader(`{"output": {"width": 1280, "height": 720, "fps": 25}, "overlay": {"type": "lower_third", "text": "A", "x": 0.1, "y": 0.8}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "image/png" || rec.Header().Get("X-Overlay-X") != "128" {
+		t.Errorf("render %d %v", rec.Code, rec.Header())
+	}
+	p := app.NewProject()
+	p.Output = project.Output{Width: 320, Height: 180, FPS: 25}
+	p.Overlays = []project.Overlay{{ID: "l3", Type: "lower_third", Text: "A", Hidden: true}, {ID: "clock", Type: "clock"}}
+	if err := st.Start(p, ""); err != nil {
+		t.Fatal(err)
+	}
+	if code, v := call(t, srv, "POST", "/api/overlays/l3", `{"text": "Grace Hopper", "for_s": 5}`); code != 200 || !strings.Contains(body(v["overlays"]), `"text":"Grace Hopper"`) {
+		t.Errorf("overlay %d %v", code, v)
+	}
+	if code, _ := call(t, srv, "POST", "/api/overlays/clock", `{"text": "x"}`); code != 400 {
+		t.Errorf("text on a clock: %d", code)
+	}
+	if code, _ := call(t, srv, "POST", "/api/overlays/nope", `{"on": true}`); code != 404 {
+		t.Errorf("unknown: %d", code)
+	}
+}

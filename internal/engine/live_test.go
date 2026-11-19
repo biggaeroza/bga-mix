@@ -300,7 +300,7 @@ func TestPreviews(t *testing.T) {
 					continue
 				}
 				img, err := jpeg.Decode(bytes.NewReader(b))
-				if err != nil || img.Bounds().Dx() != 320 || img.Bounds().Dy() != 180 {
+				if want := map[bool]int{true: 640, false: 320}[k == "program"]; err != nil || img.Bounds().Dx() != want {
 					t.Errorf("%s: %v %v", k, err, img.Bounds())
 				}
 			}

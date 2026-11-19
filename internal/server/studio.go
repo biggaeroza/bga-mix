@@ -12,6 +12,7 @@ package server
 //	GET  /api/studio?after=N            running, the show's status, the events after N
 //	GET  /api/files?dir=                a folder's sub-folders, media and show files
 //	POST /api/browse         {kind, suggested}      a native dialog (desktop only)
+//	POST /api/overlay/render {path, output, overlay}   the overlay as a PNG (X-Overlay-X/Y: where)
 //	GET  /api/devices                   cameras and sound inputs
 //	GET  /api/media?path=               a media file's format and decode check
 //	GET  /api/media/thumb?path=         its thumbnail (JPEG)
@@ -20,11 +21,14 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/biggaeroza/bga-mix/internal/app"
 	"github.com/biggaeroza/bga-mix/internal/engine"
+	"github.com/biggaeroza/bga-mix/internal/overlay"
 	"github.com/biggaeroza/bga-mix/internal/project"
 	"github.com/biggaeroza/bga-mix/internal/version"
 )
@@ -42,6 +46,35 @@ func (s *Server) studioRoutes() {
 			"home": home, "patterns": project.Patterns, "preview_fps": engine.PreviewFPS,
 			"encoders": engine.Encoders(), "stream_schemes": project.StreamSchemes,
 		})
+	})
+	// an overlay drawn as it will look on the output (the editor's preview)
+	m.HandleFunc("POST /api/overlay/render", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Path    string          `json:"path"`
+			Output  project.Output  `json:"output"`
+			Overlay project.Overlay `json:"overlay"`
+		}
+		if err := readBody(r, &req); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		if req.Output.Width < 16 || req.Output.Height < 16 || req.Output.Width > 7680 || req.Output.Height > 4320 {
+			writeErr(w, 400, errors.New("output: width and height"))
+			return
+		}
+		dir := "."
+		if req.Path != "" {
+			dir = filepath.Dir(req.Path)
+		}
+		pic, err := overlay.Draw(req.Overlay, req.Output.Width, req.Output.Height, dir, time.Now())
+		if err != nil {
+			writeErr(w, 422, err)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("X-Overlay-X", strconv.Itoa(pic.X))
+		w.Header().Set("X-Overlay-Y", strconv.Itoa(pic.Y))
+		overlay.WritePNG(w, pic.Img)
 	})
 	m.HandleFunc("GET /api/devices", func(w http.ResponseWriter, r *http.Request) {
 		cams, audio := app.Devices()

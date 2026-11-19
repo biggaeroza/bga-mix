@@ -1,6 +1,7 @@
 # BGAMix: plan
 
-Status: **approved 2026-11-18**: MIT licence, public repository `biggaeroza/bga-mix`.
+Status: **approved 2026-11-18**: MIT licence, public repository `biggaeroza/bga-mix`. All five
+milestones are done (2026-11-19); see the milestone notes in this folder.
 
 BGAMix is a live video mixer for people who want Snowmix's kind of tool without scripting it:
 a mixer that runs on a desktop, a server or a small box, takes cameras, streams and files as
@@ -30,7 +31,7 @@ Rules for the work:
 ## 2. Licence: MIT (decided 2026-11-18)
 
 The code is ours, so the licence is our choice. The dependencies don't constrain it:
-- GStreamer and the go-gst bindings are LGPL-2.1, used through dynamic linking;
+- GStreamer is LGPL-2.1, used through dynamic linking; its go-gst bindings are MIT;
 - Wails is MIT;
 - Go is BSD.
 

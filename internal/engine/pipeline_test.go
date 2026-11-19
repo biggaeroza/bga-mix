@@ -44,11 +44,12 @@ func TestPipelines(t *testing.T) {
 	if img := FeedPipeline(p.Feeds[2], 0, p.Output, "/show", "ch", ""); !strings.Contains(img, `location="/abs/card.png"`) || !strings.Contains(img, "imagefreeze is-live=true") {
 		t.Errorf("image feed: %s", img)
 	}
-	m := MixerPipeline(p, p.Start(), "R")
+	m := MixerPipeline(p, p.Start(), "R", []OverlayElement{{ID: "logo", Location: "/t/logo.png", X: 10, Y: 20, Alpha: 1}})
 	for _, want := range []string{
 		"start-time-selection=first", "sink_1::xpos=768", "sink_1::alpha=0.5", "sink_2::alpha=0",
 		`intervideosrc channel="bgamix-R-f-clip" timeout=`, // held (end hold)
 		`intervideosink channel="bgamix-R-program"`,
+		`gdkpixbufoverlay name=ov-logo location="/t/logo.png" offset-x=10 offset-y=20 alpha=1 ! intervideosink`,
 	} {
 		if !strings.Contains(m, want) {
 			t.Errorf("mixer lacks %q", want)
@@ -75,7 +76,7 @@ func TestPipelines(t *testing.T) {
 			t.Errorf("segmented lacks %q: %s", want, r)
 		}
 	}
-	if pv := PreviewPipeline(p.Output, "ch", true); !strings.Contains(pv, "width=320,height=180") || !strings.Contains(pv, "appsink name=jpeg") {
+	if pv := PreviewPipeline(p.Output, "ch", true, 320); !strings.Contains(pv, "width=320,height=180") || !strings.Contains(pv, "appsink name=jpeg") {
 		t.Errorf("preview: %s", pv)
 	}
 }
